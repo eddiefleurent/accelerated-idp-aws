@@ -7,6 +7,7 @@ import { ConsoleLogger } from 'aws-amplify/utils';
 import useAppContext from '../contexts/app';
 import listDocumentsDateShard from '../graphql/queries/listDocumentsDateShard';
 import listDocumentsDateHour from '../graphql/queries/listDocumentsDateHour';
+import listDocumentsByUseCaseQuery from '../graphql/queries/listDocumentsByUseCase';
 import getDocument from '../graphql/queries/getDocument';
 import deleteDocument from '../graphql/queries/deleteDocument';
 import reprocessDocument from '../graphql/queries/reprocessDocument';
@@ -14,18 +15,65 @@ import abortWorkflow from '../graphql/queries/abortWorkflow';
 import onCreateDocument from '../graphql/queries/onCreateDocument';
 import onUpdateDocument from '../graphql/queries/onUpdateDocument';
 import { DOCUMENT_LIST_SHARDS_PER_DAY } from '../components/document-list/documents-table-config';
+import { ALL_USE_CASES_ID } from './use-use-cases';
 
 const client = generateClient();
 
 const logger = new ConsoleLogger('useGraphQlApi');
 
-const useGraphQlApi = ({ initialPeriodsToLoad = DOCUMENT_LIST_SHARDS_PER_DAY * 2 } = {}) => {
+export const MAX_DOCUMENTS = 1000;
+
+const useGraphQlApi = ({ initialPeriodsToLoad = DOCUMENT_LIST_SHARDS_PER_DAY * 2, useCaseFilter = null } = {}) => {
   const [periodsToLoad, setPeriodsToLoad] = useState(initialPeriodsToLoad);
   const [isDocumentsListLoading, setIsDocumentsListLoading] = useState(false);
   const [documents, setDocuments] = useState([]);
+  const [isDocumentListTruncated, setIsDocumentListTruncated] = useState(false);
   const { setErrorMessage } = useAppContext();
 
+  // Use ref for useCaseFilter so closures always see the latest value
+  const useCaseFilterRef = useRef(useCaseFilter);
+  useCaseFilterRef.current = useCaseFilter;
+
   const subscriptionsRef = useRef({ onCreate: null, onUpdate: null });
+  const pendingReloadRef = useRef(false);
+  const reloadTimeoutRef = useRef(null);
+  const loadTimeoutRef = useRef(null);
+  // Guard to prevent both periodsToLoad and useCaseFilter effects from
+  // independently triggering a load on the initial mount.  The first effect
+  // to fire sets this to true and triggers the load; subsequent effects skip
+  // their initial invocation.
+  const hasMountedRef = useRef(false);
+  // Monotonically increasing load sequence token to discard stale results
+  // when the use-case filter changes while a load is still in flight.
+  const loadSequenceRef = useRef(0);
+
+  // Cleanup timeouts on unmount to prevent state updates after unmount
+  useEffect(() => {
+    return () => {
+      if (reloadTimeoutRef.current) {
+        clearTimeout(reloadTimeoutRef.current);
+      }
+      if (loadTimeoutRef.current) {
+        clearTimeout(loadTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  const finalizeDocumentsLoad = useCallback(() => {
+    if (pendingReloadRef.current) {
+      pendingReloadRef.current = false;
+      // Clear any existing timeout before setting a new one
+      if (reloadTimeoutRef.current) {
+        clearTimeout(reloadTimeoutRef.current);
+      }
+      // Briefly toggle loading off then on to ensure React sees a state change
+      // and re-triggers the loading effect with the latest filter values
+      setIsDocumentsListLoading(false);
+      reloadTimeoutRef.current = setTimeout(() => setIsDocumentsListLoading(true), 0);
+    } else {
+      setIsDocumentsListLoading(false);
+    }
+  }, []);
 
   const setDocumentsDeduped = useCallback((documentValues) => {
     logger.debug('setDocumentsDeduped called with:', documentValues);
@@ -65,42 +113,42 @@ const useGraphQlApi = ({ initialPeriodsToLoad = DOCUMENT_LIST_SHARDS_PER_DAY * 2
     });
   }, []);
 
-  const getDocumentDetailsFromIds = useCallback(
-    async (objectKeys) => {
-      // prettier-ignore
-      logger.debug('getDocumentDetailsFromIds', objectKeys);
-      const getDocumentPromises = objectKeys.map((objectKey) => client.graphql({ query: getDocument, variables: { objectKey } }));
-      const getDocumentResolutions = await Promise.allSettled(getDocumentPromises);
+  const getDocumentDetailsFromIds = useCallback(async (objectKeys) => {
+    // prettier-ignore
+    logger.debug('getDocumentDetailsFromIds', objectKeys);
+    const getDocumentPromises = objectKeys.map((objectKey) => client.graphql({ query: getDocument, variables: { objectKey } }));
+    const getDocumentResolutions = await Promise.allSettled(getDocumentPromises);
 
-      // Separate rejected promises from null/undefined results
-      const getDocumentRejected = getDocumentResolutions.filter((r) => r.status === 'rejected');
-      const fulfilledResults = getDocumentResolutions.filter((r) => r.status === 'fulfilled');
-      const getDocumentNull = fulfilledResults
-        .map((r, idx) => ({ doc: r.value?.data?.getDocument, key: objectKeys[idx] }))
-        .filter((item) => !item.doc)
-        .map((item) => item.key);
+    // Separate rejected promises from null/undefined results
+    const getDocumentRejected = getDocumentResolutions.filter((r) => r.status === 'rejected');
+    const getDocumentNull = getDocumentResolutions
+      .map((r, idx) => ({
+        status: r.status,
+        doc: r.status === 'fulfilled' ? r.value?.data?.getDocument : null,
+        key: objectKeys[idx],
+      }))
+      .filter((item) => item.status === 'fulfilled' && !item.doc)
+      .map((item) => item.key);
 
-      // Log partial failures but NEVER show error banner for individual document failures
-      if (getDocumentRejected.length > 0) {
-        logger.warn(`Failed to load ${getDocumentRejected.length} of ${objectKeys.length} document(s) due to query rejection`);
-        logger.debug('Rejected promises:', getDocumentRejected);
-      }
-      if (getDocumentNull.length > 0) {
-        logger.warn(`${getDocumentNull.length} of ${objectKeys.length} document(s) not found (returned null):`, getDocumentNull);
-        logger.warn('These documents have list entries but no corresponding document records - possible orphaned list entries');
-      }
+    // Log partial failures but NEVER show error banner for individual document failures
+    if (getDocumentRejected.length > 0) {
+      logger.warn(`Failed to load ${getDocumentRejected.length} of ${objectKeys.length} document(s) due to query rejection`);
+      logger.debug('Rejected promises:', getDocumentRejected);
+    }
+    if (getDocumentNull.length > 0) {
+      logger.warn(`${getDocumentNull.length} of ${objectKeys.length} document(s) not found (returned null):`, getDocumentNull);
+      logger.warn('These documents have list entries but no corresponding document records - possible orphaned list entries');
+    }
 
-      // Filter out null/undefined documents to prevent downstream errors
-      const documentValues = getDocumentResolutions
-        .filter((r) => r.status === 'fulfilled')
-        .map((r) => r.value?.data?.getDocument)
-        .filter((doc) => doc != null);
+    // Filter out null/undefined documents to prevent downstream errors
+    const documentValues = getDocumentResolutions
+      .filter((r) => r.status === 'fulfilled')
+      .map((r) => r.value?.data?.getDocument)
+      .filter((doc) => doc != null);
 
-      logger.debug(`Successfully loaded ${documentValues.length} of ${objectKeys.length} requested documents`);
-      return documentValues;
-    },
-    [setErrorMessage],
-  );
+    logger.debug(`Successfully loaded ${documentValues.length} of ${objectKeys.length} requested documents`);
+    return documentValues;
+  }, []);
 
   useEffect(() => {
     if (subscriptionsRef.current.onCreate) {
@@ -118,7 +166,18 @@ const useGraphQlApi = ({ initialPeriodsToLoad = DOCUMENT_LIST_SHARDS_PER_DAY * 2
           try {
             const documentValues = await getDocumentDetailsFromIds([objectKey]);
             if (documentValues && documentValues.length > 0) {
-              setDocumentsDeduped(documentValues);
+              // Filter by active use-case to avoid cross-scope leakage
+              const filter = useCaseFilterRef.current;
+              if (!filter?.useCaseId || filter.useCaseId === ALL_USE_CASES_ID) {
+                setDocumentsDeduped(documentValues);
+              } else {
+                const filtered = documentValues.filter(
+                  (doc) => doc.BusinessUnitId === filter.businessUnitId && doc.UseCaseId === filter.useCaseId,
+                );
+                if (filtered.length > 0) {
+                  setDocumentsDeduped(filtered);
+                }
+              }
             }
           } catch (error) {
             logger.error('Error processing onCreateDocument subscription:', error);
@@ -159,12 +218,30 @@ const useGraphQlApi = ({ initialPeriodsToLoad = DOCUMENT_LIST_SHARDS_PER_DAY * 2
           try {
             const documentValues = await getDocumentDetailsFromIds([documentUpdateEvent.ObjectKey]);
             if (documentValues && documentValues.length > 0) {
-              setDocumentsDeduped(documentValues);
+              // Filter by active use-case to avoid cross-scope leakage
+              const filter = useCaseFilterRef.current;
+              if (!filter?.useCaseId || filter.useCaseId === ALL_USE_CASES_ID) {
+                setDocumentsDeduped(documentValues);
+              } else {
+                const filtered = documentValues.filter(
+                  (doc) => doc.BusinessUnitId === filter.businessUnitId && doc.UseCaseId === filter.useCaseId,
+                );
+                if (filtered.length > 0) {
+                  setDocumentsDeduped(filtered);
+                }
+              }
             }
           } catch (error) {
             logger.error('Error fetching document details after update:', error);
             // Fallback to subscription data if fetch fails
-            setDocumentsDeduped([documentUpdateEvent]);
+            const filter = useCaseFilterRef.current;
+            const matchesFilter =
+              !filter?.useCaseId ||
+              filter.useCaseId === ALL_USE_CASES_ID ||
+              (documentUpdateEvent.BusinessUnitId === filter.businessUnitId && documentUpdateEvent.UseCaseId === filter.useCaseId);
+            if (matchesFilter) {
+              setDocumentsDeduped([documentUpdateEvent]);
+            }
           }
         }
       },
@@ -226,8 +303,102 @@ const useGraphQlApi = ({ initialPeriodsToLoad = DOCUMENT_LIST_SHARDS_PER_DAY * 2
     return documentData;
   };
 
-  const sendSetDocumentsForPeriod = async () => {
+  const sendSetDocumentsByUseCase = async (useCaseId, businessUnitId, loadSeq) => {
+    if (!businessUnitId || !useCaseId) {
+      setDocumentsDeduped([]);
+      setIsDocumentListTruncated(false);
+      finalizeDocumentsLoad();
+      return;
+    }
+
+    const BATCH_SIZE = 50;
+
+    try {
+      const allDocumentItems = [];
+      let nextToken = null;
+      // Paginate through documents for this use case, up to MAX_DOCUMENTS
+      do {
+        if (loadSeq !== loadSequenceRef.current) {
+          logger.debug(`Discarding stale use-case load (seq ${loadSeq}, current ${loadSequenceRef.current})`);
+          return;
+        }
+        // eslint-disable-next-line no-await-in-loop
+        const result = await client.graphql({
+          query: listDocumentsByUseCaseQuery,
+          variables: { useCaseId, businessUnitId, limit: 100, nextToken },
+        });
+        const data = result?.data?.listDocumentsByUseCase || null;
+        const docs = data?.Documents || [];
+        allDocumentItems.push(...docs);
+        nextToken = data?.nextToken || null;
+      } while (nextToken && allDocumentItems.length < MAX_DOCUMENTS);
+
+      // Discard results if a newer load has been started (filter changed mid-flight)
+      if (loadSeq !== loadSequenceRef.current) {
+        logger.debug(`Discarding stale use-case load (seq ${loadSeq}, current ${loadSequenceRef.current})`);
+        return;
+      }
+
+      // Trim to cap in case the last page pushed us over
+      const cappedItems = allDocumentItems.slice(0, MAX_DOCUMENTS);
+      // Truncated if we hit the cap and more documents exist (nextToken present)
+      const wasTruncated = nextToken != null && allDocumentItems.length >= MAX_DOCUMENTS;
+      setIsDocumentListTruncated(wasTruncated);
+      if (wasTruncated) {
+        logger.warn(`Use-case document list capped at ${MAX_DOCUMENTS} (total available: ${allDocumentItems.length}+)`);
+      }
+
+      const objectKeys = cappedItems.map((item) => item.ObjectKey);
+      if (objectKeys.length === 0) {
+        setDocumentsDeduped([]);
+        finalizeDocumentsLoad();
+        return;
+      }
+
+      // Fetch document details in bounded batches to avoid overwhelming the API
+      const allDocumentValues = [];
+      for (let i = 0; i < objectKeys.length; i += BATCH_SIZE) {
+        if (loadSeq !== loadSequenceRef.current) {
+          logger.debug(`Discarding stale use-case load during detail fetch (seq ${loadSeq}, current ${loadSequenceRef.current})`);
+          return;
+        }
+        const batch = objectKeys.slice(i, i + BATCH_SIZE);
+        // eslint-disable-next-line no-await-in-loop
+        const batchValues = await getDocumentDetailsFromIds(batch);
+        allDocumentValues.push(...batchValues);
+      }
+
+      // Discard results if a newer load has been started (filter changed mid-flight)
+      if (loadSeq !== loadSequenceRef.current) {
+        logger.debug(`Discarding stale use-case load after detail fetch (seq ${loadSeq}, current ${loadSequenceRef.current})`);
+        return;
+      }
+
+      // Merge list-entry PK/SK from cappedItems into each document detail
+      // (same pattern as sendSetDocumentsForPeriod) so ListPK/ListSK are
+      // preserved on initial use-case loads.
+      // Build a Map for O(1) lookups instead of O(n²) find-in-loop
+      const itemsByKey = new Map(cappedItems.map((item) => [item.ObjectKey, item]));
+      const mergedDocumentValues = allDocumentValues
+        .filter((detail) => detail != null)
+        .map((detail) => {
+          const matchingItem = itemsByKey.get(detail.ObjectKey);
+          return matchingItem ? { ...detail, ListPK: matchingItem.PK, ListSK: matchingItem.SK } : detail;
+        });
+
+      setDocumentsDeduped(mergedDocumentValues);
+      finalizeDocumentsLoad();
+    } catch (error) {
+      setIsDocumentListTruncated(false);
+      finalizeDocumentsLoad();
+      setErrorMessage('failed to list documents by use case - please try again later');
+      logger.error('error listing documents by use case', error);
+    }
+  };
+
+  const sendSetDocumentsForPeriod = async (loadSeq) => {
     // XXX this logic should be moved to the API
+    setIsDocumentListTruncated(false);
     try {
       const now = new Date();
 
@@ -296,11 +467,13 @@ const useGraphQlApi = ({ initialPeriodsToLoad = DOCUMENT_LIST_SHARDS_PER_DAY * 2
         }
 
         // Merge document details with PK and SK, filtering out nulls to prevent shard-level failures
+        // Build a Map for O(1) lookups instead of O(n²) find-in-loop
+        const dataByKey = new Map(documentData.map((item) => [item.ObjectKey, item]));
         return documentDetails
           .filter((detail) => detail != null)
           .map((detail) => {
-            const matchingData = documentData.find((item) => item.ObjectKey === detail.ObjectKey);
-            return { ...detail, ListPK: matchingData.PK, ListSK: matchingData.SK };
+            const matchingData = dataByKey.get(detail.ObjectKey);
+            return matchingData ? { ...detail, ListPK: matchingData.PK, ListSK: matchingData.SK } : detail;
           });
       });
 
@@ -317,8 +490,15 @@ const useGraphQlApi = ({ initialPeriodsToLoad = DOCUMENT_LIST_SHARDS_PER_DAY * 2
         .map((r) => r.value)
         .reduce((previous, current) => [...previous, ...current], []);
       logger.debug('documentValuesReduced', documentValuesReduced);
+
+      // Discard results if a newer load has been started (filter/period changed mid-flight)
+      if (loadSeq !== loadSequenceRef.current) {
+        logger.debug(`Discarding stale period load (seq ${loadSeq}, current ${loadSequenceRef.current})`);
+        return;
+      }
+
       setDocumentsDeduped(documentValuesReduced);
-      setIsDocumentsListLoading(false);
+      finalizeDocumentsLoad();
       const getDocumentsRejected = getDocumentsPromiseResolutions.filter((r) => r.status === 'rejected');
       // Only show error banner if ALL shard queries failed
       if (getDocumentsRejected.length === documentDataPromises.length) {
@@ -330,7 +510,7 @@ const useGraphQlApi = ({ initialPeriodsToLoad = DOCUMENT_LIST_SHARDS_PER_DAY * 2
         logger.debug('Rejected shard queries:', getDocumentsRejected);
       }
     } catch (error) {
-      setIsDocumentsListLoading(false);
+      finalizeDocumentsLoad();
       setErrorMessage('failed to list Documents - please try again later');
       logger.error('error obtaining document list', error);
     }
@@ -339,18 +519,51 @@ const useGraphQlApi = ({ initialPeriodsToLoad = DOCUMENT_LIST_SHARDS_PER_DAY * 2
   useEffect(() => {
     if (isDocumentsListLoading) {
       logger.debug('document list is loading');
+      // Increment the load sequence so any in-flight request from a previous
+      // filter/period is discarded when it completes.
+      loadSequenceRef.current += 1;
+      const thisLoadSeq = loadSequenceRef.current;
       // send in a timeout to avoid blocking rendering
-      setTimeout(() => {
+      loadTimeoutRef.current = setTimeout(() => {
         setDocuments([]);
-        sendSetDocumentsForPeriod();
+        const currentFilter = useCaseFilterRef.current;
+        if (currentFilter?.useCaseId && currentFilter.useCaseId !== ALL_USE_CASES_ID) {
+          sendSetDocumentsByUseCase(currentFilter.useCaseId, currentFilter.businessUnitId, thisLoadSeq);
+        } else {
+          sendSetDocumentsForPeriod(thisLoadSeq);
+        }
       }, 1);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isDocumentsListLoading]);
 
   useEffect(() => {
     logger.debug('list period changed', periodsToLoad);
+    if (!hasMountedRef.current) {
+      // First mount: claim the initial load and mark as mounted
+      hasMountedRef.current = true;
+      setIsDocumentsListLoading(true);
+      return;
+    }
+    // Subsequent changes to periodsToLoad always trigger a reload
     setIsDocumentsListLoading(true);
   }, [periodsToLoad]);
+
+  // Reload documents when the use-case filter changes
+  useEffect(() => {
+    if (!hasMountedRef.current) {
+      // Initial mount already handled by the periodsToLoad effect above;
+      // skip to avoid a duplicate load / race condition.
+      return;
+    }
+    if (isDocumentsListLoading) {
+      // A load is already in flight; queue a reload so the new filter is applied once it finishes
+      pendingReloadRef.current = true;
+      return;
+    }
+    setIsDocumentsListLoading(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [useCaseFilter?.useCaseId, useCaseFilter?.businessUnitId]);
 
   const deleteDocuments = async (objectKeys) => {
     try {
@@ -412,6 +625,7 @@ const useGraphQlApi = ({ initialPeriodsToLoad = DOCUMENT_LIST_SHARDS_PER_DAY * 2
   return {
     documents,
     isDocumentsListLoading,
+    isDocumentListTruncated,
     getDocumentDetailsFromIds,
     setIsDocumentsListLoading,
     setPeriodsToLoad,

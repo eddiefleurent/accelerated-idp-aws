@@ -10,6 +10,7 @@ const listUsers = /* GraphQL */ `
         persona
         status
         createdAt
+        allowedUseCases
       }
     }
   }

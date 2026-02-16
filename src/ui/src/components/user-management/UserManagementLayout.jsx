@@ -15,7 +15,9 @@ import {
   FormField,
   Input,
   Select,
+  Multiselect,
   StatusIndicator,
+  Badge,
 } from '@cloudscape-design/components';
 import { generateClient } from 'aws-amplify/api';
 import { ConsoleLogger } from 'aws-amplify/utils';
@@ -23,6 +25,7 @@ import { ConsoleLogger } from 'aws-amplify/utils';
 import useUserRole from '../../hooks/use-user-role';
 import useAppContext from '../../contexts/app';
 import useSettingsContext from '../../contexts/settings';
+import useUseCases from '../../hooks/use-use-cases';
 import listUsers from '../../graphql/queries/listUsers';
 import createUserMutation from '../../graphql/mutations/createUser';
 import deleteUserMutation from '../../graphql/mutations/deleteUser';
@@ -33,15 +36,34 @@ const UserManagementLayout = () => {
   const { awsConfig } = useAppContext();
   const { settings } = useSettingsContext();
   const { isAdmin, loading: roleLoading } = useUserRole();
+  const { useCases } = useUseCases({ isAdmin, authLoading: roleLoading });
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [email, setEmail] = useState('');
   const [persona, setPersona] = useState('Reviewer');
+  const [selectedUseCases, setSelectedUseCases] = useState([]);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [emailError, setEmailError] = useState('');
+
+  const hasUseCases = useCases && useCases.length > 0;
+
+  const decodeUseCaseValue = (value) =>
+    (value || '')
+      .split('/')
+      .map((part) => decodeURIComponent(part))
+      .join('/');
+
+  const useCaseOptions = useMemo(() => {
+    if (!useCases || useCases.length === 0) return [];
+    return useCases.map((uc) => ({
+      label: uc.name || `${uc.businessUnitId}/${uc.useCaseId}`,
+      value: `${encodeURIComponent(uc.businessUnitId)}/${encodeURIComponent(uc.useCaseId)}`,
+      description: uc.description || `${uc.businessUnitId}/${uc.useCaseId}`,
+    }));
+  }, [useCases]);
 
   const allowedDomains = useMemo(() => {
     const domains = settings?.AllowedSignUpEmailDomains || '';
@@ -55,6 +77,7 @@ const UserManagementLayout = () => {
 
   const personaOptions = [
     { label: 'Admin', value: 'Admin' },
+    { label: 'Supervisor', value: 'Supervisor' },
     { label: 'Reviewer', value: 'Reviewer' },
   ];
 
@@ -139,10 +162,19 @@ const UserManagementLayout = () => {
 
     try {
       const client = generateClient();
-      logger.debug('Creating user:', { email, persona });
+      // Backend normalizes admin to ["*"]; for reviewers, only include
+      // allowedUseCases when use cases exist so stacks without multi-use-case
+      // mode don't receive an empty array that would deny all access.
+      const allowedUseCases =
+        persona === 'Admin' ? undefined : hasUseCases ? selectedUseCases.map((opt) => decodeUseCaseValue(opt.value)) : undefined;
+      logger.debug('Creating user:', { email, persona, allowedUseCases: allowedUseCases ?? '(server default)' });
+      const variables = { email, persona };
+      if (allowedUseCases !== undefined) {
+        variables.allowedUseCases = allowedUseCases;
+      }
       await client.graphql({
         query: createUserMutation,
-        variables: { email, persona },
+        variables,
       });
 
       logger.debug('User created successfully');
@@ -150,10 +182,10 @@ const UserManagementLayout = () => {
       setShowCreateModal(false);
       setEmail('');
       setPersona('Reviewer');
+      setSelectedUseCases([]);
       await loadUsers();
     } catch (err) {
       logger.error('Failed to create user:', err);
-      // Extract error message from GraphQL error structure
       const errorMessage = err.errors?.[0]?.message || err.message || 'Unknown error';
       setError(`Failed to create user: ${errorMessage}`);
     } finally {
@@ -199,12 +231,29 @@ const UserManagementLayout = () => {
     setShowCreateModal(false);
     setEmail('');
     setPersona('Reviewer');
+    setSelectedUseCases([]);
     setError('');
     setEmailError('');
   };
 
   const handleRefresh = () => {
     loadUsers(true);
+  };
+
+  const formatAllowedUseCases = (allowedUseCasesList) => {
+    if (!allowedUseCasesList || allowedUseCasesList.length === 0) {
+      return <Box color="text-status-inactive">None</Box>;
+    }
+    if (allowedUseCasesList.includes('*')) {
+      return <Badge color="blue">All use cases</Badge>;
+    }
+    return (
+      <SpaceBetween direction="horizontal" size="xxs">
+        {allowedUseCasesList.map((uc) => (
+          <Badge key={uc}>{decodeUseCaseValue(uc)}</Badge>
+        ))}
+      </SpaceBetween>
+    );
   };
 
   // Load users when awsConfig becomes available and user is admin
@@ -246,6 +295,15 @@ const UserManagementLayout = () => {
       cell: (item) => <Box color={item.persona === 'Admin' ? 'text-status-info' : 'text-body-default'}>{item.persona}</Box>,
       sortingField: 'persona',
     },
+    ...(hasUseCases
+      ? [
+          {
+            id: 'allowedUseCases',
+            header: 'Allowed Use Cases',
+            cell: (item) => formatAllowedUseCases(item.allowedUseCases),
+          },
+        ]
+      : []),
     {
       id: 'status',
       header: 'Status',
@@ -364,6 +422,27 @@ const UserManagementLayout = () => {
                   options={personaOptions}
                 />
               </FormField>
+              {hasUseCases && persona !== 'Admin' && (
+                <FormField
+                  label="Allowed Use Cases"
+                  description="Select which use cases this user can access. Admin users automatically get access to all use cases."
+                  constraintText="Users without any assigned use cases will be denied access to all use-case-scoped data"
+                >
+                  <Multiselect
+                    selectedOptions={selectedUseCases}
+                    onChange={({ detail }) => setSelectedUseCases(detail.selectedOptions)}
+                    options={useCaseOptions}
+                    placeholder="Select use cases"
+                    filteringType="auto"
+                    tokenLimit={3}
+                  />
+                </FormField>
+              )}
+              {hasUseCases && persona === 'Admin' && (
+                <FormField label="Allowed Use Cases">
+                  <Alert type="info">Admin users automatically have access to all use cases.</Alert>
+                </FormField>
+              )}
             </SpaceBetween>
           </Form>
         </Modal>

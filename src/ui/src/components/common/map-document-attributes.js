@@ -24,6 +24,8 @@ const mapDocumentsAttributes = (documents) => {
   return documents.map((item) => {
     const {
       ObjectKey: objectKey,
+      BusinessUnitId: businessUnitId,
+      UseCaseId: useCaseId,
       ObjectStatus: objectStatus,
       InitialEventTime: initialEventTime,
       QueuedTime: queuedTime,
@@ -96,6 +98,8 @@ const mapDocumentsAttributes = (documents) => {
     const mapping = {
       uniqueId,
       objectKey,
+      businessUnitId: businessUnitId || '',
+      useCaseId: useCaseId || '',
       objectStatus,
       initialEventTime: formatDate(initialEventTime),
       queuedTime: formatDate(queuedTime),
@@ -133,8 +137,6 @@ const mapDocumentsAttributes = (documents) => {
       hitlReviewedByEmail,
       hitlReviewHistory,
     };
-
-    console.log('mapped-document-attributes', mapping);
 
     return mapping;
   });

@@ -27,6 +27,7 @@ import { ConsoleLogger } from 'aws-amplify/utils';
 import useConfiguration from '../../hooks/use-configuration';
 import useConfigurationLibrary from '../../hooks/use-configuration-library';
 import useSettingsContext from '../../contexts/settings';
+import useUseCaseContext from '../../contexts/useCase';
 import ConfigBuilder from './ConfigBuilder';
 import { deepMerge } from '../../utils/configUtils';
 import syncBdaIdpMutation from '../../graphql/queries/syncBdaIdp';
@@ -64,6 +65,17 @@ const isNumericValue = (val) => {
 };
 
 const ConfigurationLayout = () => {
+  const useCaseContext = useUseCaseContext();
+  const effectiveUseCase = useCaseContext?.effectiveUseCase || null;
+
+  const scopedIds =
+    effectiveUseCase?.businessUnitId && effectiveUseCase?.useCaseId
+      ? {
+          businessUnitId: effectiveUseCase.businessUnitId,
+          useCaseId: effectiveUseCase.useCaseId,
+        }
+      : {};
+
   const {
     schema,
     mergedConfig,
@@ -76,7 +88,7 @@ const ConfigurationLayout = () => {
     fetchConfiguration,
     isCustomized,
     resetToDefault,
-  } = useConfiguration();
+  } = useConfiguration(scopedIds);
 
   const [formValues, setFormValues] = useState({});
   const [jsonContent, setJsonContent] = useState('');
@@ -902,13 +914,6 @@ const ConfigurationLayout = () => {
           } else {
             console.log('DEBUG: Classes unchanged, not including in save');
           }
-        }
-
-        // CRITICAL: Always include the current rule schema (rule_classes) if it exists OR is explicitly empty
-        // This ensures empty arrays are saved (to wipe all rule classes) and prevents schema loss
-        if (formValues.rule_classes && Array.isArray(formValues.rule_classes)) {
-          builtObject.rule_classes = formValues.rule_classes;
-          console.log('DEBUG: Including rule schema (rule_classes) in save:', formValues.rule_classes);
         }
 
         // CRITICAL: Always include the current rule schema (rule_classes) if it exists OR is explicitly empty

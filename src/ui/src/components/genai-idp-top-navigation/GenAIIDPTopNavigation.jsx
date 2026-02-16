@@ -48,7 +48,7 @@ const SignOutModal = ({ visible, setVisible }) => {
 
 const GenAIIDPTopNavigation = () => {
   const { user } = useAppContext();
-  const { isAdmin, isReviewer, loading: roleLoading } = useUserRole();
+  const { isAdmin, isSupervisor, isReviewer, loading: roleLoading } = useUserRole();
   const userId = user?.username || 'user';
   const [isSignOutModalVisible, setIsSignOutModalVisiblesetVisible] = useState(false);
 
@@ -56,6 +56,7 @@ const GenAIIDPTopNavigation = () => {
   const getRoleDisplay = () => {
     if (roleLoading) return '';
     if (isAdmin) return 'Admin';
+    if (isSupervisor) return 'Supervisor';
     if (isReviewer) return 'Reviewer';
     return '';
   };
@@ -76,7 +77,7 @@ const GenAIIDPTopNavigation = () => {
               description: roleDisplay ? (
                 <SpaceBetween direction="horizontal" size="xs">
                   <span>{userId}</span>
-                  <Badge color={isAdmin ? 'blue' : 'grey'}>{roleDisplay}</Badge>
+                  <Badge color={isAdmin ? 'blue' : isSupervisor ? 'green' : 'grey'}>{roleDisplay}</Badge>
                 </SpaceBetween>
               ) : (
                 userId

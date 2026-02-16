@@ -19,11 +19,15 @@ import { generateClient } from 'aws-amplify/api';
 import uploadDocument from '../../graphql/queries/uploadDocument';
 
 import useSettingsContext from '../../contexts/settings';
+import useUseCaseContext from '../../contexts/useCase';
+import { ALL_USE_CASES_ID } from '../../hooks/use-use-cases';
 
 const client = generateClient();
 
 const UploadDocumentPanel = () => {
   const { settings } = useSettingsContext();
+  const useCaseContext = useUseCaseContext();
+  const effectiveUseCase = useCaseContext?.effectiveUseCase || null;
   const [selectedFiles, setSelectedFiles] = useState([]);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadStatus, setUploadStatus] = useState([]);
@@ -54,6 +58,19 @@ const UploadDocumentPanel = () => {
       return;
     }
 
+    // When multi-use-case mode is active, require a specific use case selection
+    const isMultiUseCase = useCaseContext?.isMultiUseCaseEnabled;
+    const selectedUseCase = useCaseContext?.selectedUseCase;
+    const isUseCaseLoading = useCaseContext?.loading;
+    if (isUseCaseLoading) {
+      setError('Use cases are still loading. Please try again in a moment.');
+      return;
+    }
+    if (isMultiUseCase && (!selectedUseCase || selectedUseCase.useCaseId === ALL_USE_CASES_ID)) {
+      setError('Please select a specific use case before uploading. "All Use Cases" cannot be used for uploads.');
+      return;
+    }
+
     setIsUploading(true);
     setUploadStatus([]);
     setError(null);
@@ -69,14 +86,22 @@ const UploadDocumentPanel = () => {
         try {
           // Step 1: Get presigned URL data
           console.log(`Getting upload credentials for ${file.name}...`);
-          console.log(`Using prefix: ${prefix || 'none'}`);
+
+          // Build upload prefix: {bu}/{uc}/{user-prefix} when use case is selected
+          const normalizedUserPrefix = (prefix || '').replace(/^\/+|\/+$/g, '');
+          let uploadPrefix = normalizedUserPrefix;
+          if (effectiveUseCase?.businessUnitId && effectiveUseCase?.useCaseId) {
+            const ucPrefix = `${effectiveUseCase.businessUnitId}/${effectiveUseCase.useCaseId}`;
+            uploadPrefix = uploadPrefix ? `${ucPrefix}/${uploadPrefix}` : ucPrefix;
+          }
+          console.log(`Using prefix: ${uploadPrefix || 'none'}`);
 
           const response = await client.graphql({
             query: uploadDocument,
             variables: {
               fileName: file.name,
               contentType: file.type,
-              prefix: prefix || '', // Use the user-provided prefix or empty string
+              prefix: uploadPrefix, // Use-case-scoped prefix
               bucket: settings.InputBucket, // Explicitly pass the input bucket
             },
           });
@@ -157,6 +182,14 @@ const UploadDocumentPanel = () => {
       )}
 
       <SpaceBetween size="l">
+        {effectiveUseCase && effectiveUseCase.useCaseId !== ALL_USE_CASES_ID && (
+          <Alert type="info">
+            Uploading to use case:{' '}
+            <strong>
+              {effectiveUseCase.businessUnitId}/{effectiveUseCase.useCaseId}
+            </strong>
+          </Alert>
+        )}
         <FormField label="Optional folder prefix (e.g., invoices/2024)">
           <Input value={prefix} onChange={handlePrefixChange} placeholder="Leave empty for root folder" disabled={isUploading} />
         </FormField>
