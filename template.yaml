@@ -61,6 +61,8 @@ Mappings:
       ConfigPath: "rule-validation"
     rule-extraction:
       ConfigPath: "rule-extraction"
+    multi-use-case-sample:
+      ConfigPath: "multi-use-case-sample"
     default:
       ConfigPath: "rvl-cdip"
 
@@ -115,6 +117,19 @@ Parameters:
     AllowedPattern: '^(|s3://.*)$'
     ConstraintDescription: Must be empty or a valid S3 URI (e.g., s3://my-bucket/custom-config/config.yaml)
 
+  UseCaseConfigs:
+    Type: String
+    Default: ""
+    NoEcho: true
+    MaxLength: 4096
+    AllowedPattern: '^(|[\s\S]*\S[\s\S]*)$'
+    ConstraintDescription: Must be empty or a string containing at least one non-whitespace character (max 4096 chars). Leading and trailing whitespace is allowed.
+    Description: >-
+      JSON array of use case configurations for multi-use-case document handling.
+      Each entry: {"businessUnitId":"string","useCaseId":"string","name":"optional","description":"optional","config":"s3://... or inline object"}.
+      Leave blank to manage use cases via the Web UI or CLI script (scripts/manage_use_cases.py).
+      Do not include secrets here; store sensitive values in SSM Parameter Store or Secrets Manager.
+
   # Pattern 1 Parameters
 
   Pattern1BDAProjectArn:
@@ -151,6 +166,7 @@ Parameters:
       - "ocr-benchmark"
       - "rule-validation"
       - "rule-extraction"
+      - "multi-use-case-sample"
       - "default"
     Description: >-
       Select the configuration preset for Pattern 2. Each configuration contains pre-tuned settings for specific document processing scenarios see https://github.com/aws-samples/sample-genai-idp/blob/main/config_library/README.md. Note: Custom configuration overrides the selected pattern configuration when provided.
@@ -479,6 +495,7 @@ Conditions:
     !Not [ !Equals [ !Ref DocumentSectionsCrawlerFrequency, "Manual" ] ]
   HasPermissionsBoundary: !Not [ !Equals [ !Ref PermissionsBoundaryArn, "" ] ]
   HasCustomConfigPath: !Not [ !Equals [ !Ref CustomConfigPath, "" ] ]
+  HasUseCaseConfigs: !Not [ !Equals [ !Ref UseCaseConfigs, "" ] ]
   IsS3VectorsVectorStore: !Equals [ !Ref KnowledgeBaseVectorStore, "S3_VECTORS" ]
   CreateAgentCoreLambda: !Equals [ !Ref EnableMCP, "true" ]
   CreateExternalAppClient: !Equals [ !Ref EnableMCP, "true" ]
@@ -519,6 +536,7 @@ Metadata:
           default: "Custom Configuration"
         Parameters:
           - CustomConfigPath
+          - UseCaseConfigs
       - Label:
           default: "Evaluation"
         Parameters:
@@ -587,6 +605,8 @@ Metadata:
         default: "Pattern3 - Configuration Preset"
       CustomConfigPath:
         default: "Custom Configuration Path"
+      UseCaseConfigs:
+        default: "Use Case Configs (JSON)"
       PostProcessingLambdaHookFunctionArn:
         default: "Post Processing Lambda Hook Function ARN"
       EvaluationBaselineBucketName:
@@ -1058,6 +1078,7 @@ Resources:
                 - dynamodb:Query
               Resource:
                 - !GetAtt TrackingTable.Arn
+                - !Sub "${TrackingTable.Arn}/index/*"
                 - !GetAtt ConfigurationTable.Arn
                 - !GetAtt AgentTable.Arn
             - Effect: Allow
@@ -1265,6 +1286,10 @@ Resources:
         ArtifactPrefix: "<ARTIFACT_PREFIX_TOKEN>"
         SourceZipfile: "<PATTERN1_SOURCE_ZIPFILE_TOKEN>"
         EnableECRImageScanning: !Ref EnableECRImageScanning
+        UseCaseConfigs: !If
+          - HasUseCaseConfigs
+          - !Ref UseCaseConfigs
+          - !Ref AWS::NoValue
 
   PATTERN2STACK:
     DependsOn:
@@ -1321,6 +1346,10 @@ Resources:
           - !Ref EvaluationBaselineBucketName
         SaveReportingFunctionName: !Ref SaveReportingDataFunctionV2
         EnableECRImageScanning: !Ref EnableECRImageScanning
+        UseCaseConfigs: !If
+          - HasUseCaseConfigs
+          - !Ref UseCaseConfigs
+          - !Ref AWS::NoValue
 
   PATTERN3STACK:
     DependsOn:
@@ -1377,6 +1406,10 @@ Resources:
         ArtifactPrefix: "<ARTIFACT_PREFIX_TOKEN>"
         SourceZipfile: "<PATTERN3_SOURCE_ZIPFILE_TOKEN>"
         EnableECRImageScanning: !Ref EnableECRImageScanning
+        UseCaseConfigs: !If
+          - HasUseCaseConfigs
+          - !Ref UseCaseConfigs
+          - !Ref AWS::NoValue
 
   ##########################################################################
   # Encryption key
@@ -1476,6 +1509,9 @@ Resources:
         # Lambda Layers
         IDPCommonBaseLayerArn: !Ref IDPCommonBaseLayer
         IDPCommonAgentsLayerArn: !Ref IDPCommonAgentsLayer
+        
+        # Cognito
+        UserPoolId: !Ref UserPool
         
   CustomerManagedEncryptionKey:
     DependsOn:
@@ -2950,11 +2986,30 @@ Resources:
           AttributeType: S
         - AttributeName: SK
           AttributeType: S
+        - AttributeName: UseCaseId
+          AttributeType: S
       KeySchema:
         - AttributeName: PK
           KeyType: HASH
         - AttributeName: SK
           KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: UseCaseIndex
+          KeySchema:
+            - AttributeName: UseCaseId
+              KeyType: HASH
+            - AttributeName: SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - ObjectKey
+              - ObjectStatus
+              - InitialEventTime
+              - QueuedTime
+              - BusinessUnitId
+              - HITLStatus
+              - ExpiresAfter
       TimeToLiveSpecification:
         AttributeName: ExpiresAfter
         Enabled: true
@@ -4743,6 +4798,7 @@ Resources:
                 - dynamodb:Query
               Resource:
                 - !GetAtt TrackingTable.Arn
+                - !Sub "${TrackingTable.Arn}/index/*"
             - Effect: Allow
               Action:
                 - cloudformation:DescribeStackResources
@@ -5034,6 +5090,7 @@ Resources:
                 - dynamodb:Query
               Resource:
                 - !GetAtt TrackingTable.Arn
+                - !Sub "${TrackingTable.Arn}/index/*"
             - Effect: Allow
               Action:
                 - cloudformation:DescribeStackResources
@@ -5156,6 +5213,9 @@ Resources:
           AttributeDataType: String
           Mutable: false
           Required: true
+        - Name: allowed_use_cases
+          AttributeDataType: String
+          Mutable: true
       UsernameConfiguration:
         CaseSensitive: false
 
@@ -5184,6 +5244,10 @@ Resources:
       ReadAttributes:
         - email
         - email_verified
+        - preferred_username
+        - custom:allowed_use_cases
+      WriteAttributes:
+        - email
         - preferred_username
       RefreshTokenValidity: 30
       SupportedIdentityProviders:
@@ -5362,12 +5426,20 @@ Resources:
       Precedence: 0
       UserPoolId: !Ref UserPool
 
+  SupervisorGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      Description: Use-case Supervisors with full document visibility and HITL management
+      GroupName: Supervisor
+      Precedence: 1
+      UserPoolId: !Ref UserPool
+
   ReviewerGroup:
     Type: AWS::Cognito::UserPoolGroup
     Properties:
       Description: Document Reviewers for HITL
       GroupName: Reviewer
-      Precedence: 1
+      Precedence: 2
       UserPoolId: !Ref UserPool
 
   AdminUserToGroupAttachment:
@@ -6558,6 +6630,7 @@ Resources:
         Variables:
           USER_POOL_ID: !Ref UserPool
           ADMIN_GROUP: !Ref AdminGroup
+          SUPERVISOR_GROUP: !Ref SupervisorGroup
           REVIEWER_GROUP: !Ref ReviewerGroup
           USERS_TABLE_NAME: !Ref UsersTable
           ALLOWED_SIGNUP_EMAIL_DOMAINS: !Ref AllowedSignUpEmailDomain
@@ -6615,6 +6688,7 @@ Resources:
         Variables:
           USER_POOL_ID: !Ref UserPool
           ADMIN_GROUP: !Ref AdminGroup
+          SUPERVISOR_GROUP: !Ref SupervisorGroup
           REVIEWER_GROUP: !Ref ReviewerGroup
       LoggingConfig:
         LogGroup: !Ref UserSyncFunctionLogGroup

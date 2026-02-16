@@ -2225,6 +2225,8 @@ def build_parameters(
     additional_params: Optional[Dict[str, str]] = None,
     region: Optional[str] = None,
     stack_name: Optional[str] = None,
+    business_unit_id: Optional[str] = None,
+    use_case_id: Optional[str] = None,
 ) -> Dict[str, str]:
     """
     Build CloudFormation parameters dictionary
@@ -2247,11 +2249,21 @@ def build_parameters(
         additional_params: Additional parameters as dict - optional
         region: AWS region (auto-detected if not provided)
         stack_name: Stack name (helps determine upload bucket for updates)
+        business_unit_id: Business unit identifier (for multi-tenant use-case routing) - optional
+        use_case_id: Use case identifier (for multi-tenant use-case routing) - optional
 
     Returns:
         Dictionary of parameter key-value pairs (only includes explicitly provided values)
     """
     parameters = {}
+
+    # Normalize empty strings to None
+    if business_unit_id is not None:
+        business_unit_id = business_unit_id.strip() or None
+    if use_case_id is not None:
+        use_case_id = use_case_id.strip() or None
+
+    # Defer BU/UC pair validation until after overrides are merged below
 
     # Only add parameters if explicitly provided
     if admin_email is not None:
@@ -2317,8 +2329,47 @@ def build_parameters(
             parameters["CustomConfigPath"] = custom_config
             logger.info(f"Using S3 config: {custom_config}")
 
+    # Add business unit and use case identifiers (for future use)
+    if business_unit_id is not None:
+        parameters["BusinessUnitId"] = business_unit_id
+
+    if use_case_id is not None:
+        parameters["UseCaseId"] = use_case_id
+
     # Add any additional parameters
     if additional_params:
-        parameters.update(additional_params)
+        # Trim overrides from additional_params
+        bu_override = additional_params.get("BusinessUnitId")
+        uc_override = additional_params.get("UseCaseId")
+        if bu_override is not None:
+            bu_override = bu_override.strip() or None
+        if uc_override is not None:
+            uc_override = uc_override.strip() or None
 
+        # Compute effective/merged BU and UC by considering overrides first,
+        # then explicit function args, then any values already in parameters.
+        final_bu = bu_override or business_unit_id or parameters.get("BusinessUnitId")
+        final_uc = uc_override or use_case_id or parameters.get("UseCaseId")
+
+        # Only reject when exactly one of the final values is present
+        if (final_bu is None) ^ (final_uc is None):
+            raise ValueError("BusinessUnitId and UseCaseId must be provided together")
+
+        # Build a sanitized copy so trimmed values are used downstream
+        sanitized = dict(additional_params)
+        if bu_override is not None:
+            sanitized["BusinessUnitId"] = bu_override
+        elif "BusinessUnitId" in sanitized:
+            del sanitized["BusinessUnitId"]
+        if uc_override is not None:
+            sanitized["UseCaseId"] = uc_override
+        elif "UseCaseId" in sanitized:
+            del sanitized["UseCaseId"]
+        parameters.update(sanitized)
+
+    # Final validation after all sources are merged
+    if (parameters.get("BusinessUnitId") is None) ^ (
+        parameters.get("UseCaseId") is None
+    ):
+        raise ValueError("BusinessUnitId and UseCaseId must be provided together")
     return parameters
