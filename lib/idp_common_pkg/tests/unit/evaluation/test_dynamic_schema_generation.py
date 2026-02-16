@@ -53,7 +53,9 @@ class TestDynamicSchemaGeneration:
         assert props["amount"]["type"] == "number"
         assert props["amount"]["x-aws-idp-evaluation-method"] == "NUMERIC_EXACT"
 
-        assert props["quantity"]["type"] == "integer"
+        # genson infers integer for whole numbers; _normalize_integer_to_number
+        # converts to number for extraction compatibility (int/float both valid)
+        assert props["quantity"]["type"] == "number"
         assert props["quantity"]["x-aws-idp-evaluation-method"] == "NUMERIC_EXACT"
 
         assert props["is_paid"]["type"] == "boolean"
@@ -107,6 +109,9 @@ class TestDynamicSchemaGeneration:
         assert "description" in item_props
         assert "quantity" in item_props
         assert "price" in item_props
+        # Verify numeric types are normalized to "number"
+        assert item_props["quantity"]["type"] == "number"
+        assert item_props["price"]["type"] == "number"
 
     def test_infer_schema_from_array_of_primitives(self, evaluation_service):
         """Test schema inference from array of primitive values."""
