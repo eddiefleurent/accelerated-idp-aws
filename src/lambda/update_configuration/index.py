@@ -370,6 +370,99 @@ def handler(event: Dict[str, Any], context: Any) -> None:
                 configurations["DefaultPricing"] = resolved_pricing
                 logger.info("Loaded DefaultPricing configuration")
 
+            # Process UseCaseConfigs if provided
+            # Each entry: {businessUnitId, useCaseId, name, description, config (S3 URI or inline)}
+            use_case_configs = properties.get("UseCaseConfigs")
+            if use_case_configs:
+                if isinstance(use_case_configs, str):
+                    use_case_configs = json.loads(use_case_configs)
+
+                if not isinstance(use_case_configs, list):
+                    raise ValueError("UseCaseConfigs must be a JSON array of objects")
+
+                # Two-pass approach: validate all entries first, then persist.
+                # This prevents partial writes when later entries fail validation.
+                uc_errors: list[str] = []
+                resolved_entries: list[dict] = []
+
+                # --- Pass 1: Validate and resolve all entries ---
+                for uc_entry in use_case_configs:
+                    try:
+                        # Use shared validation from idp_common
+                        bu_id, uc_id = ConfigurationManager.validate_use_case_config_entry(
+                            uc_entry
+                        )
+
+                        uc_name = uc_entry.get("name", f"{bu_id}/{uc_id}")
+                        uc_desc = uc_entry.get("description", "")
+
+                        uc_config = resolve_content(uc_entry.get("config", {}))
+                        if not isinstance(uc_config, dict):
+                            raise ValueError(
+                                f"UseCaseConfigs entry config for {bu_id}/{uc_id} must resolve to a dict"
+                            )
+                        uc_config = merge_custom_with_defaults(uc_config)
+                        if region_type in ["us", "eu"]:
+                            uc_config = swap_model_ids(uc_config, region_type)
+
+                        resolved_entries.append(
+                            {
+                                "bu_id": bu_id,
+                                "uc_id": uc_id,
+                                "uc_name": uc_name,
+                                "uc_desc": uc_desc,
+                                "uc_config": uc_config,
+                            }
+                        )
+                    except Exception as e:
+                        safe_bu = (
+                            uc_entry.get("businessUnitId")
+                            if isinstance(uc_entry, dict)
+                            else None
+                        )
+                        safe_uc = (
+                            uc_entry.get("useCaseId")
+                            if isinstance(uc_entry, dict)
+                            else None
+                        )
+                        logger.error(
+                            "Validation failed for UseCaseConfigs entry (bu=%s, uc=%s): %s",
+                            safe_bu,
+                            safe_uc,
+                            e,
+                        )
+                        uc_errors.append(f"{safe_bu}/{safe_uc}: {e}")
+
+                # Fail early if any entry had validation errors — no writes occurred
+                if uc_errors:
+                    error_summary = (
+                        f"UseCaseConfigs validation failed with {len(uc_errors)} error(s): "
+                        + "; ".join(uc_errors)
+                    )
+                    logger.warning(error_summary)
+                    raise ValueError(error_summary)
+
+                # --- Pass 2: Persist all validated entries ---
+                for entry in resolved_entries:
+                    manager.save_use_case_configuration(
+                        entry["bu_id"],
+                        entry["uc_id"],
+                        "Default",
+                        entry["uc_config"],
+                    )
+                    manager.register_use_case(
+                        entry["bu_id"],
+                        entry["uc_id"],
+                        entry["uc_name"],
+                        entry["uc_desc"],
+                    )
+                    logger.info(
+                        "Saved use-case configuration: %s/%s (%s)",
+                        entry["bu_id"],
+                        entry["uc_id"],
+                        entry["uc_name"],
+                    )
+
             # Apply region-specific model swapping to all configurations at once
             if region_type in ["us", "eu"] and configurations:
                 configurations = swap_model_ids(configurations, region_type)

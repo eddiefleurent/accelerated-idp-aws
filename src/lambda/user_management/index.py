@@ -3,11 +3,12 @@
 
 """Lambda function for user management operations with DynamoDB storage and Cognito sync."""
 
+import json
 import logging
 import os
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 import boto3
 from boto3.dynamodb.conditions import Key
@@ -21,8 +22,21 @@ cognito = boto3.client("cognito-idp")
 USERS_TABLE_NAME = os.environ.get("USERS_TABLE_NAME", "")
 USER_POOL_ID = os.environ.get("USER_POOL_ID", "")
 ADMIN_GROUP = os.environ.get("ADMIN_GROUP", "Admin")
+SUPERVISOR_GROUP = os.environ.get("SUPERVISOR_GROUP", "Supervisor")
 REVIEWER_GROUP = os.environ.get("REVIEWER_GROUP", "Reviewer")
 ALLOWED_SIGNUP_EMAIL_DOMAINS = os.environ.get("ALLOWED_SIGNUP_EMAIL_DOMAINS", "")
+
+
+def normalize_use_case_list(use_cases):
+    """Normalize a list of use-case strings: strip whitespace, remove empties, deduplicate.
+
+    Preserves order of first occurrence. Raises ValueError when the list
+    contains empty-after-strip entries.
+    """
+    normalized = [uc.strip() for uc in use_cases if isinstance(uc, str)]
+    if any(not uc for uc in normalized):
+        raise ValueError("allowedUseCases cannot contain empty strings")
+    return list(dict.fromkeys(normalized))
 
 
 def handler(event, context):
@@ -46,6 +60,7 @@ def create_user(args):
     """Create user in DynamoDB and sync to Cognito."""
     email = args["email"]
     persona = args["persona"]
+    allowed_use_cases = args.get("allowedUseCases")
     user_id = str(uuid.uuid4())
 
     # Validate email format
@@ -69,20 +84,42 @@ def create_user(args):
                 )
 
     # Validate persona
-    if persona not in ["Admin", "Reviewer"]:
-        raise ValueError(f"Invalid persona: {persona}. Must be 'Admin' or 'Reviewer'")
+    if persona not in ["Admin", "Supervisor", "Reviewer"]:
+        raise ValueError(f"Invalid persona: {persona}. Must be 'Admin', 'Supervisor', or 'Reviewer'")
+
+    # Normalize allowed_use_cases: admins always get wildcard; validate type for others
+    if persona == "Admin":
+        allowed_use_cases = ["*"]
+    else:
+        if allowed_use_cases is None:
+            allowed_use_cases = []
+        if not isinstance(allowed_use_cases, list) or any(
+            not isinstance(uc, str) for uc in allowed_use_cases
+        ):
+            raise ValueError("allowedUseCases must be a list of strings")
+        allowed_use_cases = normalize_use_case_list(allowed_use_cases)
+        if "*" in allowed_use_cases:
+            raise ValueError("Only Admin users can use wildcard allowedUseCases")
+        if persona == "Supervisor" and not allowed_use_cases:
+            raise ValueError("Supervisors must have explicit use-case assignments")
 
     logger.info(f"Creating user with email {email} and persona {persona}")
 
     table = dynamodb.Table(USERS_TABLE_NAME)
 
-    # Check if user already exists
+    # Check if user already exists (early-exit optimization before the
+    # atomic conditional write below)
     existing_users = table.query(
         IndexName="EmailIndex", KeyConditionExpression=Key("email").eq(email)
     )
 
     if existing_users.get("Items"):
         raise ValueError(f"User with email {email} already exists")
+
+    # Serialize allowed_use_cases for storage (JSON string)
+    allowed_use_cases_json = json.dumps(allowed_use_cases)
+
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     # Create user record in DynamoDB
     user_record = {
@@ -92,19 +129,43 @@ def create_user(args):
         "email": email,
         "persona": persona,
         "status": "active",
-        "createdAt": datetime.utcnow().isoformat() + "Z",
-        "updatedAt": datetime.utcnow().isoformat() + "Z",
+        "allowedUseCases": allowed_use_cases_json,
+        "createdAt": now,
+        "updatedAt": now,
     }
 
-    table.put_item(Item=user_record)
+    # Use conditional expression to prevent race conditions: if two concurrent
+    # requests for the same email both pass the EmailIndex check above, only
+    # the first put_item succeeds. Without this, the second request could
+    # overwrite the DynamoDB record and then fail on Cognito, leaving an
+    # orphaned Cognito user after rollback deletes the first request's record.
+    try:
+        table.put_item(
+            Item=user_record,
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+    except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+        raise ValueError(f"User with email {email} already exists")
 
     # Sync to Cognito
     try:
-        sync_user_to_cognito(user_id, email, persona, "create")
+        sync_user_to_cognito(user_id, email, persona, "create", allowed_use_cases)
     except Exception as e:
         logger.error(f"Failed to sync user to Cognito: {e}")
         # Rollback DynamoDB record
-        table.delete_item(Key={"PK": f"USER#{user_id}", "SK": f"USER#{user_id}"})
+        try:
+            table.delete_item(Key={"PK": f"USER#{user_id}", "SK": f"USER#{user_id}"})
+        except Exception as rollback_error:
+            logger.error(
+                f"Failed to rollback DynamoDB record for user {user_id}: {rollback_error}"
+            )
+        # Attempt to clean up potentially orphaned Cognito user
+        try:
+            cognito.admin_delete_user(UserPoolId=USER_POOL_ID, Username=email)
+        except Exception as cognito_cleanup_error:
+            logger.error(
+                f"Failed to clean up Cognito user {email}: {cognito_cleanup_error}"
+            )
         raise e
 
     logger.info(f"User {email} created successfully")
@@ -114,6 +175,7 @@ def create_user(args):
         "persona": persona,
         "status": "active",
         "createdAt": user_record["createdAt"],
+        "allowedUseCases": allowed_use_cases,
     }
 
 
@@ -174,13 +236,34 @@ def list_users():
 
     users = []
     for item in response.get("Items", []):
+        # Parse allowedUseCases from JSON string stored in DynamoDB
+        allowed_raw = item.get("allowedUseCases", "[]")
+        try:
+            allowed_list = json.loads(allowed_raw) if isinstance(allowed_raw, str) else allowed_raw
+        except (json.JSONDecodeError, TypeError):
+            allowed_list = []
+        if isinstance(allowed_list, list):
+            try:
+                allowed_list = normalize_use_case_list(allowed_list)
+            except ValueError:
+                allowed_list = []
+        else:
+            allowed_list = []
+
+        # Admins always have wildcard access regardless of what's stored
+        persona = item["persona"]
+        if persona != "Admin":
+            allowed_list = [uc for uc in allowed_list if uc != "*"]
+        effective_allowed = ["*"] if persona == "Admin" else allowed_list
+
         users.append(
             {
                 "userId": item["userId"],
                 "email": item["email"],
-                "persona": item["persona"],
+                "persona": persona,
                 "status": item.get("status", "active"),
                 "createdAt": format_datetime(item.get("createdAt")),
+                "allowedUseCases": effective_allowed,
             }
         )
 
@@ -212,12 +295,14 @@ def sync_cognito_users_to_dynamodb():
         for user in page.get("Users", []):
             username = user["Username"]
 
-            # Get email from attributes
+            # Get email and allowed_use_cases from attributes
             email = username
+            allowed_use_cases_raw = "[]"
             for attr in user.get("Attributes", []):
                 if attr["Name"] == "email":
                     email = attr["Value"]
-                    break
+                elif attr["Name"] == "custom:allowed_use_cases":
+                    allowed_use_cases_raw = attr["Value"]
 
             # Skip if already in DynamoDB
             if email in existing_emails:
@@ -233,6 +318,9 @@ def sync_cognito_users_to_dynamodb():
                     if group["GroupName"] == ADMIN_GROUP:
                         persona = "Admin"
                         break
+                    elif group["GroupName"] == SUPERVISOR_GROUP:
+                        persona = "Supervisor"
+                        # Don't break; Admin takes priority if user is in both groups
             except Exception as e:
                 logger.warning(f"Could not get groups for user {username}: {e}")
                 persona = "Reviewer"
@@ -244,7 +332,36 @@ def sync_cognito_users_to_dynamodb():
                 dt = user["UserCreateDate"]
                 created_at = dt.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
             else:
-                created_at = datetime.utcnow().isoformat() + "Z"
+                created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+            # Admins always get wildcard access regardless of what is stored
+            # in the Cognito custom:allowed_use_cases attribute (which may be
+            # absent for users created directly in the Cognito console).
+            if persona == "Admin":
+                allowed_use_cases_raw = json.dumps(["*"])
+            else:
+                # Apply the same normalization rules used by create_user:
+                # parse the raw JSON, strip whitespace, remove duplicates, and
+                # reject wildcard access for non-Admin personas.
+                try:
+                    uc_list = json.loads(allowed_use_cases_raw) if isinstance(allowed_use_cases_raw, str) else allowed_use_cases_raw
+                except (json.JSONDecodeError, TypeError):
+                    uc_list = []
+                if not isinstance(uc_list, list):
+                    uc_list = []
+                try:
+                    uc_list = normalize_use_case_list(uc_list)
+                except ValueError:
+                    uc_list = []
+                # Non-admins must not have wildcard access
+                uc_list = [uc for uc in uc_list if uc != "*"]
+                if persona == "Supervisor" and not uc_list:
+                    logger.warning(
+                        "Supervisor %s has no allowed use cases; "
+                        "assign at least one use case to avoid a no-access account.",
+                        email,
+                    )
+                allowed_use_cases_raw = json.dumps(uc_list)
 
             user_record = {
                 "PK": f"USER#{user_id}",
@@ -253,30 +370,52 @@ def sync_cognito_users_to_dynamodb():
                 "email": email,
                 "persona": persona,
                 "status": "active",
+                "allowedUseCases": allowed_use_cases_raw,
                 "createdAt": created_at,
-                "updatedAt": datetime.utcnow().isoformat() + "Z",
+                "updatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             }
 
             table.put_item(Item=user_record)
             logger.info(f"Synced Cognito user {email} to DynamoDB")
 
 
-def sync_user_to_cognito(user_id, email, persona, operation):
+def sync_user_to_cognito(user_id, email, persona, operation, allowed_use_cases=None):
     """Sync user operations to Cognito."""
     if operation == "create":
+        # Build user attributes
+        user_attributes = [
+            {"Name": "email", "Value": email},
+            {"Name": "email_verified", "Value": "true"},
+            {"Name": "custom:user_id", "Value": user_id},
+        ]
+
+        # Set allowed_use_cases custom attribute
+        # Admins get wildcard access; non-admins get their specified use cases
+        if persona == "Admin":
+            uc_value = json.dumps(["*"])
+        elif allowed_use_cases:
+            uc_value = json.dumps(allowed_use_cases)
+        else:
+            uc_value = json.dumps([])
+        user_attributes.append(
+            {"Name": "custom:allowed_use_cases", "Value": uc_value}
+        )
+
         # Create user in Cognito
         cognito.admin_create_user(
             UserPoolId=USER_POOL_ID,
             Username=email,
-            UserAttributes=[
-                {"Name": "email", "Value": email},
-                {"Name": "email_verified", "Value": "true"},
-            ],
+            UserAttributes=user_attributes,
             DesiredDeliveryMediums=["EMAIL"],
         )
 
         # Add to appropriate group
-        group_name = ADMIN_GROUP if persona.lower() == "admin" else REVIEWER_GROUP
+        if persona == "Admin":
+            group_name = ADMIN_GROUP
+        elif persona == "Supervisor":
+            group_name = SUPERVISOR_GROUP
+        else:
+            group_name = REVIEWER_GROUP
         cognito.admin_add_user_to_group(
             UserPoolId=USER_POOL_ID, Username=email, GroupName=group_name
         )
