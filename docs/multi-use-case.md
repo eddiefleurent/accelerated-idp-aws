@@ -599,8 +599,6 @@ done
 7. Select `All Use Cases` and verify all documents appear (Admin only)
 8. Click on a completed document to view extraction results -- verify correct document types were extracted
 
-```
-
 ## Pattern Support
 
 | Feature | Pattern 1 (BDA) | Pattern 2 (Textract + Bedrock) |
