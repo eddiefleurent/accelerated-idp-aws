@@ -503,7 +503,7 @@ export const DocumentPanel = ({ item, setToolsOpen, getDocumentDetailsFromIds, o
 
   // Fetch configuration for dynamic confidence threshold
   const { mergedConfig } = useConfiguration();
-  const { isReviewer } = useUserRole();
+  const { isReviewer, isSupervisor } = useUserRole();
 
   // Check if document can be aborted
   const canAbort = ABORTABLE_STATUSES.includes(localItem?.objectStatus);
@@ -514,7 +514,7 @@ export const DocumentPanel = ({ item, setToolsOpen, getDocumentDetailsFromIds, o
   const isHitlSkipped = hitlStatusLower === 'skipped' || hitlStatusLower === 'reviewskipped';
   const isHitlCompleted = hitlStatusLower === 'completed' || hitlStatusLower === 'reviewcompleted';
   const hasPendingHITL = localItem?.hitlTriggered && !isHitlCompleted && !isHitlSkipped;
-  const showStartReview = isReviewer && hasPendingHITL && !hasReviewOwner;
+  const showStartReview = (isReviewer || isSupervisor) && hasPendingHITL && !hasReviewOwner;
 
   // Handle Start Review button click
   const handleStartReview = async () => {

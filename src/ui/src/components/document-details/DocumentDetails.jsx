@@ -39,8 +39,8 @@ const DocumentDetails = () => {
 
   const { documents, getDocumentDetailsFromIds, setToolsOpen, deleteDocuments, reprocessDocuments, abortWorkflows } = useDocumentsContext();
   const { settings } = useSettingsContext();
-  const { isReviewer, isAdmin } = useUserRole();
-  const isReviewerOnly = isReviewer && !isAdmin;
+  const { isReviewer, isSupervisor, isAdmin } = useUserRole();
+  const isReviewerOnly = isReviewer && !isAdmin && !isSupervisor;
 
   const [document, setDocument] = useState(null);
   const [isDeleteModalVisible, setIsDeleteModalVisible] = useState(false);

@@ -1,12 +1,15 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: MIT-0
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { generateClient } from 'aws-amplify/api';
 import { ConsoleLogger } from 'aws-amplify/utils';
 import getConfigurationQuery from '../graphql/queries/getConfiguration';
+import getUseCaseConfigurationQuery from '../graphql/queries/getUseCaseConfiguration';
 import updateConfigurationMutation from '../graphql/queries/updateConfiguration';
+import updateUseCaseConfigurationMutation from '../graphql/mutations/updateUseCaseConfiguration';
 import { deepMerge } from '../utils/configUtils';
+import { ALL_USE_CASES_ID } from './use-use-cases';
 
 const client = generateClient();
 const logger = new ConsoleLogger('useConfiguration');
@@ -197,7 +200,11 @@ const getDiff = (oldConfig, newConfig) => {
   return diff;
 };
 
-const useConfiguration = () => {
+const useConfiguration = ({ businessUnitId = null, useCaseId = null } = {}) => {
+  const hasBusinessUnitId = Boolean(businessUnitId) && businessUnitId !== ALL_USE_CASES_ID;
+  const hasUseCaseId = Boolean(useCaseId) && useCaseId !== ALL_USE_CASES_ID;
+  const isUseCaseScoped = hasBusinessUnitId && hasUseCaseId;
+  const isPartialScope = (hasBusinessUnitId && !hasUseCaseId) || (!hasBusinessUnitId && hasUseCaseId);
   const [schema, setSchema] = useState(null);
   const [defaultConfig, setDefaultConfig] = useState(null);
   const [customConfig, setCustomConfig] = useState(null);
@@ -205,8 +212,10 @@ const useConfiguration = () => {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(null);
+  const requestIdRef = useRef(0);
 
   const fetchConfiguration = async (silent = false) => {
+    const requestId = ++requestIdRef.current;
     // Use different loading states for initial load vs background refresh
     if (silent) {
       setRefreshing(true);
@@ -214,19 +223,52 @@ const useConfiguration = () => {
       setLoading(true);
     }
     setError(null);
-    try {
-      logger.debug('Fetching configuration...');
-      const result = await client.graphql({ query: getConfigurationQuery });
-      logger.debug('API response:', result);
 
-      const response = result.data.getConfiguration;
+    // Fail fast if only one of businessUnitId/useCaseId is provided
+    if (isPartialScope) {
+      setError('Both businessUnitId and useCaseId are required for use-case configuration.');
+      if (silent) setRefreshing(false);
+      else setLoading(false);
+      return;
+    }
+
+    try {
+      let response;
+      if (isUseCaseScoped) {
+        logger.debug(`Fetching use-case configuration for ${businessUnitId}/${useCaseId}...`);
+        const result = await client.graphql({
+          query: getUseCaseConfigurationQuery,
+          variables: { businessUnitId, useCaseId },
+        });
+        logger.debug('Use-case config API response:', result);
+        response = result.data.getUseCaseConfiguration;
+      } else {
+        logger.debug('Fetching global configuration...');
+        const result = await client.graphql({ query: getConfigurationQuery });
+        logger.debug('API response:', result);
+        response = result.data.getConfiguration;
+      }
 
       if (!response.success) {
         const errorMsg = response.error?.message || 'Failed to load configuration';
         throw new Error(errorMsg);
       }
 
-      const { Schema, Default, Custom } = response;
+      let { Schema, Default, Custom } = response;
+
+      // Use-case-scoped config returns only Default (fully merged); no Schema or Custom
+      // Fetch global config for the schema when in use-case mode
+      if (isUseCaseScoped && !Schema) {
+        const globalResult = await client.graphql({ query: getConfigurationQuery });
+        const globalResponse = globalResult.data.getConfiguration;
+        if (!globalResponse.success) {
+          const globalErrorMsg = globalResponse.error?.message || 'Failed to load global schema for use-case mode';
+          throw new Error(globalErrorMsg);
+        }
+        Schema = globalResponse.Schema;
+        // For use-case configs, the Default is the full merged config; Custom is empty
+        Custom = null;
+      }
 
       // Log raw data types
       logger.debug('Raw data types:', {
@@ -296,6 +338,9 @@ const useConfiguration = () => {
         throw new Error('Invalid default configuration data structure');
       }
 
+      // Discard stale response if scope changed while request was in-flight
+      if (requestId !== requestIdRef.current) return;
+
       setSchema(schemaObj);
 
       // Normalize boolean values in both default and custom configs
@@ -333,16 +378,22 @@ const useConfiguration = () => {
       logger.error('Error fetching configuration', err);
       setError(`Failed to load configuration: ${err.message}`);
     } finally {
-      if (silent) {
-        setRefreshing(false);
-      } else {
-        setLoading(false);
+      if (requestId === requestIdRef.current) {
+        if (silent) {
+          setRefreshing(false);
+        } else {
+          setLoading(false);
+        }
       }
     }
   };
 
   const updateConfiguration = async (newCustomConfig) => {
     setError(null);
+    if (isPartialScope) {
+      setError('Both businessUnitId and useCaseId are required for use-case configuration.');
+      return false;
+    }
     try {
       logger.debug('Updating config with:', newCustomConfig);
 
@@ -361,12 +412,20 @@ const useConfiguration = () => {
 
       logger.debug('Sending customConfig string:', configString);
 
-      const result = await client.graphql({
-        query: updateConfigurationMutation,
-        variables: { customConfig: configString },
-      });
+      let result;
+      if (isUseCaseScoped) {
+        result = await client.graphql({
+          query: updateUseCaseConfigurationMutation,
+          variables: { businessUnitId, useCaseId, customConfig: configString },
+        });
+      } else {
+        result = await client.graphql({
+          query: updateConfigurationMutation,
+          variables: { customConfig: configString },
+        });
+      }
 
-      const response = result.data.updateConfiguration;
+      const response = isUseCaseScoped ? result.data.updateUseCaseConfiguration : result.data.updateConfiguration;
 
       if (!response.success) {
         const errorMsg = response.error?.message || 'Failed to update configuration';
@@ -391,6 +450,10 @@ const useConfiguration = () => {
   // The strip_matching_defaults function on backend removes values matching Default
   const resetToDefault = async (path) => {
     if (!path || !customConfig || !defaultConfig) return false;
+    if (isPartialScope) {
+      setError('Both businessUnitId and useCaseId are required for use-case configuration.');
+      return false;
+    }
 
     setError(null);
     try {
@@ -406,12 +469,20 @@ const useConfiguration = () => {
       logger.debug('Sending update payload (backend will auto-clean):', updatePayload);
 
       // Send the default value to backend
-      const result = await client.graphql({
-        query: updateConfigurationMutation,
-        variables: { customConfig: JSON.stringify(updatePayload) },
-      });
+      let result;
+      if (isUseCaseScoped) {
+        result = await client.graphql({
+          query: updateUseCaseConfigurationMutation,
+          variables: { businessUnitId, useCaseId, customConfig: JSON.stringify(updatePayload) },
+        });
+      } else {
+        result = await client.graphql({
+          query: updateConfigurationMutation,
+          variables: { customConfig: JSON.stringify(updatePayload) },
+        });
+      }
 
-      const response = result.data.updateConfiguration;
+      const response = isUseCaseScoped ? result.data.updateUseCaseConfiguration : result.data.updateConfiguration;
 
       if (!response.success) {
         const errorMsg = response.error?.message || 'Failed to reset to default';
@@ -524,8 +595,15 @@ const useConfiguration = () => {
   };
 
   useEffect(() => {
+    // Clear stale state when scope changes to avoid displaying
+    // configuration from a previous business unit / use case
+    setSchema(null);
+    setDefaultConfig(null);
+    setCustomConfig(null);
+    setMergedConfig(null);
     fetchConfiguration();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [businessUnitId, useCaseId]);
 
   return {
     schema,

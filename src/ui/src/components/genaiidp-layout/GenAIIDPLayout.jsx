@@ -13,6 +13,7 @@ import useNotifications from '../../hooks/use-notifications';
 import useSplitPanel from '../../hooks/use-split-panel';
 import useGraphQlApi from '../../hooks/use-graphql-api';
 import useAppContext from '../../contexts/app';
+import useUseCaseContext from '../../contexts/useCase';
 
 import DocumentList from '../document-list';
 import DocumentDetails from '../document-details';
@@ -29,6 +30,7 @@ import ToolsPanel from './tools-panel';
 import SplitPanel from './documents-split-panel';
 import ConfigurationLayout from '../configuration-layout';
 import PricingLayout from '../pricing-layout';
+import UseCaseManagement from '../use-case-management/UseCaseManagement';
 
 import { DOCUMENT_LIST_SHARDS_PER_DAY, PERIODS_TO_LOAD_STORAGE_KEY } from '../document-list/documents-table-config';
 
@@ -36,6 +38,8 @@ const logger = new ConsoleLogger('GenAIIDPLayout');
 
 const GenAIIDPLayout = ({ children }) => {
   const { navigationOpen, setNavigationOpen } = useAppContext();
+  const useCaseContext = useUseCaseContext();
+  const effectiveUseCase = useCaseContext?.effectiveUseCase || null;
 
   const notifications = useNotifications();
   const [toolsOpen, setToolsOpen] = useState(false);
@@ -69,13 +73,14 @@ const GenAIIDPLayout = ({ children }) => {
     documents,
     getDocumentDetailsFromIds,
     isDocumentsListLoading,
+    isDocumentListTruncated,
     periodsToLoad,
     setIsDocumentsListLoading,
     setPeriodsToLoad,
     deleteDocuments,
     reprocessDocuments,
     abortWorkflows,
-  } = useGraphQlApi({ initialPeriodsToLoad });
+  } = useGraphQlApi({ initialPeriodsToLoad, useCaseFilter: effectiveUseCase });
 
   // eslint-disable-next-line prettier/prettier
   const { splitPanelOpen, onSplitPanelToggle, splitPanelSize, onSplitPanelResize } = useSplitPanel(selectedItems);
@@ -85,6 +90,7 @@ const GenAIIDPLayout = ({ children }) => {
     documents,
     getDocumentDetailsFromIds,
     isDocumentsListLoading,
+    isDocumentListTruncated,
     selectedItems,
     setIsDocumentsListLoading,
     setPeriodsToLoad,
@@ -125,6 +131,7 @@ const GenAIIDPLayout = ({ children }) => {
               <Route path="upload" element={<UploadDocumentPanel />} />
               <Route path="discovery" element={<DiscoveryPanel />} />
               <Route path="users" element={<UserManagementLayout />} />
+              <Route path="use-cases" element={<UseCaseManagement />} />
               <Route path="*" element={<DocumentDetails />} />
             </Routes>
           )

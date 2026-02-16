@@ -23,6 +23,20 @@ export const COLUMN_DEFINITIONS_MAIN = [
     width: 300,
   },
   {
+    id: 'businessUnitId',
+    header: 'Business Unit',
+    cell: (item) => item.businessUnitId || '-',
+    sortingField: 'businessUnitId',
+    width: 150,
+  },
+  {
+    id: 'useCaseId',
+    header: 'Use Case',
+    cell: (item) => item.useCaseId || '-',
+    sortingField: 'useCaseId',
+    width: 150,
+  },
+  {
     id: 'objectStatus',
     header: 'Status',
     cell: (item) => item.objectStatus,
@@ -88,7 +102,7 @@ export const COLUMN_DEFINITIONS_MAIN = [
   },
 ];
 
-export const DEFAULT_SORT_COLUMN = COLUMN_DEFINITIONS_MAIN[2]; // initialEventTime
+export const DEFAULT_SORT_COLUMN = COLUMN_DEFINITIONS_MAIN.find((c) => c.id === 'initialEventTime') || COLUMN_DEFINITIONS_MAIN[0];
 
 export const SELECTION_LABELS = {
   itemSelectionLabel: (data, row) => `select ${row.objectKey}`,
@@ -107,6 +121,8 @@ const VISIBLE_CONTENT_OPTIONS = [
     label: 'Document list properties',
     options: [
       { id: 'objectKey', label: 'Document ID', editable: false },
+      { id: 'businessUnitId', label: 'Business Unit' },
+      { id: 'useCaseId', label: 'Use Case' },
       { id: 'objectStatus', label: 'Status' },
       { id: 'initialEventTime', label: 'Submitted' },
       { id: 'completionTime', label: 'Completed' },
