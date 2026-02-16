@@ -29,6 +29,8 @@ from .constants import (
     CONFIG_TYPE_DEFAULT_PRICING,
     CONFIG_TYPE_CUSTOM_PRICING,
     VALID_CONFIG_TYPES,
+    DEFAULT_BUSINESS_UNIT_ID,
+    DEFAULT_USE_CASE_ID,
 )
 
 logger = logging.getLogger(__name__)
@@ -106,15 +108,29 @@ class ConfigurationReader:
         return deep_update(merged, custom)
 
     @overload
-    def get_merged_configuration(self, *, as_model: Literal[True]) -> IDPConfig: ...
+    def get_merged_configuration(
+        self,
+        *,
+        as_model: Literal[True],
+        business_unit_id: Optional[str] = None,
+        use_case_id: Optional[str] = None,
+    ) -> IDPConfig: ...
 
     @overload
     def get_merged_configuration(
-        self, *, as_model: Literal[False]
+        self,
+        *,
+        as_model: Literal[False],
+        business_unit_id: Optional[str] = None,
+        use_case_id: Optional[str] = None,
     ) -> Dict[str, Any]: ...
 
     def get_merged_configuration(
-        self, *, as_model: bool = False
+        self,
+        *,
+        as_model: bool = False,
+        business_unit_id: Optional[str] = None,
+        use_case_id: Optional[str] = None,
     ) -> Union[IDPConfig, Dict[str, Any]]:
         """
         Get and merge Default and Custom configurations for runtime processing.
@@ -124,17 +140,55 @@ class ConfigurationReader:
         - Custom: SPARSE DELTAS ONLY (raw from DynamoDB, NO Pydantic defaults!)
         - Merged: Default deep-updated with Custom = final runtime config
 
+        When business_unit_id and use_case_id are provided (and not _default),
+        uses the 5-layer merge: Global Default → UC Default → UC Custom.
+
         This is THE method to use for all runtime document processing.
 
         Args:
             as_model: If True, return IDPConfig Pydantic model. If False (default), return dict.
+            business_unit_id: Optional business unit for use-case-scoped config.
+            use_case_id: Optional use case for use-case-scoped config.
 
         Returns:
             Merged configuration as IDPConfig or dictionary
+
+        Raises:
+            ValueError: If only one of business_unit_id/use_case_id is provided,
+                if the Default configuration is not found, or if a use-case-scoped
+                configuration is requested but does not exist.
         """
         try:
-            # Get Default configuration (Pydantic validated - this is correct for Default)
-            default_config = self.get_configuration("Default", as_dict=True)
+            # Guard against partial use-case identifiers
+            if (business_unit_id and not use_case_id) or (
+                use_case_id and not business_unit_id
+            ):
+                raise ValueError(
+                    "business_unit_id and use_case_id must be provided together"
+                )
+
+            # Use-case-scoped path: delegate to ConfigurationManager
+            if (
+                business_unit_id
+                and use_case_id
+                and business_unit_id != DEFAULT_BUSINESS_UNIT_ID
+                and use_case_id != DEFAULT_USE_CASE_ID
+            ):
+                uc_config = self.manager.get_use_case_configuration(
+                    business_unit_id, use_case_id
+                )
+                if uc_config is None:
+                    raise ValueError(
+                        f"Use-case configuration not found for "
+                        f"{business_unit_id}/{use_case_id}. Ensure a Global "
+                        f"Default configuration exists and the use case is registered."
+                    )
+                if as_model:
+                    return uc_config
+                return uc_config.model_dump(mode="python")
+
+            # Global path: existing Default + Custom merge
+            default_config = self.get_configuration(CONFIG_TYPE_DEFAULT, as_dict=True)
             if not default_config:
                 raise ValueError("Default configuration not found")
 
@@ -143,7 +197,7 @@ class ConfigurationReader:
 
             # Get Custom configuration as RAW dict (NO Pydantic defaults!)
             # This is critical for the sparse delta pattern to work correctly
-            custom_config = self.manager.get_raw_configuration("Custom")
+            custom_config = self.manager.get_raw_configuration(CONFIG_TYPE_CUSTOM)
 
             # If no custom config exists, use default as-is
             if not custom_config:
@@ -170,7 +224,11 @@ class ConfigurationReader:
 
 @overload
 def get_config(
-    *, table_name: Optional[str] = None, as_model: Literal[True]
+    *,
+    table_name: Optional[str] = None,
+    as_model: Literal[True],
+    business_unit_id: Optional[str] = None,
+    use_case_id: Optional[str] = None,
 ) -> IDPConfig:
     """
     Get configuration as Pydantic model.
@@ -184,21 +242,34 @@ def get_config(
 
 @overload
 def get_config(
-    *, table_name: Optional[str] = None, as_model: Literal[False] = False
+    *,
+    table_name: Optional[str] = None,
+    as_model: Literal[False] = False,
+    business_unit_id: Optional[str] = None,
+    use_case_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Get configuration as mutable dictionary."""
     ...
 
 
 def get_config(
-    *, table_name: Optional[str] = None, as_model: bool = False
+    *,
+    table_name: Optional[str] = None,
+    as_model: bool = False,
+    business_unit_id: Optional[str] = None,
+    use_case_id: Optional[str] = None,
 ) -> Union[IDPConfig, Dict[str, Any]]:
     """
     Get the merged configuration using the environment variable for table name.
 
+    When business_unit_id and use_case_id are provided, returns a use-case-scoped
+    configuration merged from Global Default → UC Default → UC Custom.
+
     Args:
         table_name: Optional override for configuration table name
         as_model: If True, return IDPConfig Pydantic model. If False (default), return dict.
+        business_unit_id: Optional business unit for use-case-scoped config.
+        use_case_id: Optional use case for use-case-scoped config.
 
     Returns:
         Merged configuration as IDPConfig (with .to_dict() helper) or mutable dictionary.
@@ -211,6 +282,17 @@ def get_config(
         # Get as model, convert to dict with extras
         config = get_config(as_model=True)
         config_dict = config.to_dict(sagemaker_endpoint_name=endpoint)
+
+        # Get use-case-scoped config
+        config = get_config(
+            as_model=True,
+            business_unit_id="retail-banking",
+            use_case_id="mortgage-processing",
+        )
     """
     reader = ConfigurationReader(table_name)
-    return reader.get_merged_configuration(as_model=as_model)
+    return reader.get_merged_configuration(
+        as_model=as_model,
+        business_unit_id=business_unit_id,
+        use_case_id=use_case_id,
+    )

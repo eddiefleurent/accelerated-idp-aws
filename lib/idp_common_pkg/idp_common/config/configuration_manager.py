@@ -3,28 +3,34 @@
 
 from __future__ import annotations
 
-import boto3
 import json
-import os
-from typing import Dict, Any, Optional, Union
-from botocore.exceptions import ClientError
 import logging
+import os
+from copy import deepcopy
+from typing import Any, Dict, Literal, Optional, Union, overload
 
-from .models import IDPConfig, SchemaConfig, PricingConfig, ConfigurationRecord
-from .merge_utils import (
-    deep_update,
-    apply_delta_with_deletions,
-    strip_matching_defaults,
-    get_diff_dict,
-)
+import boto3
+from botocore.exceptions import ClientError
+
 from .constants import (
-    CONFIG_TYPE_SCHEMA,
-    CONFIG_TYPE_DEFAULT,
     CONFIG_TYPE_CUSTOM,
-    CONFIG_TYPE_DEFAULT_PRICING,
     CONFIG_TYPE_CUSTOM_PRICING,
-    VALID_CONFIG_TYPES,
+    CONFIG_TYPE_DEFAULT,
+    CONFIG_TYPE_DEFAULT_PRICING,
+    CONFIG_TYPE_SCHEMA,
+    DEFAULT_BUSINESS_UNIT_ID,
+    DEFAULT_USE_CASE_ID,
+    USE_CASE_CONFIG_PREFIX,
+    USE_CASE_REGISTRY_KEY,
 )
+from .exceptions import UseCaseRegistrationError
+from .merge_utils import (
+    apply_delta_with_deletions,
+    deep_update,
+    get_diff_dict,
+    strip_matching_defaults,
+)
+from .models import ConfigurationRecord, IDPConfig, PricingConfig, SchemaConfig
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +71,7 @@ class ConfigurationManager:
             )
 
         self.dynamodb = boto3.resource("dynamodb")
-        self.table = self.dynamodb.Table(
-            table_name
-        )  # pyright: ignore[reportAttributeAccessIssue]
+        self.table = self.dynamodb.Table(table_name)  # pyright: ignore[reportAttributeAccessIssue]
         self.table_name = table_name
         logger.info(f"ConfigurationManager initialized with table: {table_name}")
 
@@ -396,7 +400,7 @@ class ConfigurationManager:
 
         if not isinstance(custom_config, PricingConfig):
             logger.warning(
-                f"CustomPricing is not PricingConfig, returning DefaultPricing"
+                "CustomPricing is not PricingConfig, returning DefaultPricing"
             )
             return default_config
 
@@ -632,6 +636,637 @@ class ConfigurationManager:
 
         return True
 
+    # ===== Use-Case Configuration Methods =====
+
+    @staticmethod
+    def _use_case_config_key(
+        business_unit_id: str, use_case_id: str, config_type: str
+    ) -> str:
+        """Build a DynamoDB key for use-case-scoped configuration.
+
+        Format: UC#{business_unit_id}#{use_case_id}#{config_type}
+
+        Args:
+            business_unit_id: Business unit identifier
+            use_case_id: Use case identifier
+            config_type: Configuration type (Default, Custom, Schema)
+
+        Returns:
+            Composite key string for DynamoDB
+        """
+        if "#" in business_unit_id or "#" in use_case_id:
+            raise ValueError(
+                "business_unit_id and use_case_id cannot contain the '#' delimiter character"
+            )
+        if config_type not in (
+            CONFIG_TYPE_DEFAULT,
+            CONFIG_TYPE_CUSTOM,
+            CONFIG_TYPE_SCHEMA,
+        ):
+            raise ValueError(
+                f"config_type must be Default, Custom, or Schema (got: {config_type!r})"
+            )
+        return (
+            f"{USE_CASE_CONFIG_PREFIX}#{business_unit_id}#{use_case_id}#{config_type}"
+        )
+
+    def _is_default_use_case(
+        self,
+        business_unit_id: Optional[str],
+        use_case_id: Optional[str],
+    ) -> bool:
+        """Check if the given IDs represent the default (global) use case.
+
+        Only explicit ``None`` or the reserved ``DEFAULT_*`` constants are
+        treated as defaults.  Empty strings are *not* considered defaults and
+        will fall through to normal use-case validation, preventing accidental
+        global-config routing when a caller provides ``""``.
+        """
+        if business_unit_id is None and use_case_id is None:
+            return True
+        # If only one is None, it's a partial/invalid pair — not default
+        if business_unit_id is None or use_case_id is None:
+            return False
+        return (
+            business_unit_id == DEFAULT_BUSINESS_UNIT_ID
+            and use_case_id == DEFAULT_USE_CASE_ID
+        )
+
+    def get_use_case_configuration(
+        self, business_unit_id: str, use_case_id: str
+    ) -> Optional[IDPConfig]:
+        """
+        Get fully merged configuration for a specific use case.
+
+        Merge order (5-layer):
+        1. System defaults (code-packaged, already in Global Default)
+        2. Global Default (DynamoDB "Default")
+        3. Global Custom (DynamoDB "Custom") — user overrides, inherited as baseline
+        4. UC Default (DynamoDB "UC#{bu}#{uc}#Default") — sparse delta
+        5. UC Custom (DynamoDB "UC#{bu}#{uc}#Custom") — sparse delta
+        Result: (Global Default + Global Custom) deep-updated with UC Default, then UC Custom
+
+        Args:
+            business_unit_id: Business unit identifier
+            use_case_id: Use case identifier
+
+        Returns:
+            Merged IDPConfig for the use case, or None if Global Default missing
+        """
+        # Layer 1+2: Global Default + Global Custom (merged baseline)
+        # Using get_merged_configuration() ensures tenant-level customizations
+        # stored in CONFIG_TYPE_CUSTOM are included in the base config, not
+        # dropped when UC layers are applied on top.
+        base_config = self.get_merged_configuration()
+        if base_config is None or not isinstance(base_config, IDPConfig):
+            logger.warning("Global Default configuration not found")
+            return None
+
+        if self._is_default_use_case(business_unit_id, use_case_id):
+            return base_config
+
+        # Validate IDs before constructing DynamoDB keys to fail fast on
+        # invalid characters (e.g., '#', '/') or reserved identifiers.
+        self.validate_use_case_ids(business_unit_id, use_case_id)
+
+        merged_dict = base_config.model_dump(mode="python")
+
+        # Layer 3: UC Default (sparse delta)
+        uc_default_key = self._use_case_config_key(
+            business_unit_id, use_case_id, CONFIG_TYPE_DEFAULT
+        )
+        uc_default_dict = self.get_raw_configuration(uc_default_key)
+        if uc_default_dict:
+            deep_update(merged_dict, uc_default_dict)
+
+        # Layer 4: UC Custom (sparse delta)
+        uc_custom_key = self._use_case_config_key(
+            business_unit_id, use_case_id, CONFIG_TYPE_CUSTOM
+        )
+        uc_custom_dict = self.get_raw_configuration(uc_custom_key)
+        if uc_custom_dict:
+            deep_update(merged_dict, uc_custom_dict)
+
+        logger.info(
+            f"Merged use-case configuration for {business_unit_id}/{use_case_id}"
+        )
+        return IDPConfig(**merged_dict)
+
+    @staticmethod
+    def validate_use_case_ids(business_unit_id: str, use_case_id: str) -> None:
+        """Validate use-case identifiers.
+
+        Rejects empty strings, IDs containing the ``#`` or ``/``
+        delimiters, and reserved identifiers (``DEFAULT`` or those
+        starting with ``DEFAULT_``).
+
+        Args:
+            business_unit_id: Business unit identifier to validate
+            use_case_id: Use case identifier to validate
+
+        Raises:
+            ValueError: If any identifier is invalid.
+        """
+        if not isinstance(business_unit_id, str):
+            raise ValueError(
+                f"business_unit_id must be a string (got {type(business_unit_id).__name__})"
+            )
+        if not isinstance(use_case_id, str):
+            raise ValueError(
+                f"use_case_id must be a string (got {type(use_case_id).__name__})"
+            )
+
+        if not business_unit_id or not business_unit_id.strip():
+            raise ValueError("business_unit_id must be a non-empty string")
+        if not use_case_id or not use_case_id.strip():
+            raise ValueError("use_case_id must be a non-empty string")
+        for field_name, value in [
+            ("business_unit_id", business_unit_id),
+            ("use_case_id", use_case_id),
+        ]:
+            if "#" in value:
+                raise ValueError(
+                    f"{field_name} cannot contain the '#' delimiter "
+                    f"character (got: {value!r})"
+                )
+            if "/" in value:
+                raise ValueError(
+                    f"{field_name} cannot contain the '/' delimiter "
+                    f"character (got: {value!r})"
+                )
+            normalized = value.upper().lstrip("_")
+            if normalized == "DEFAULT" or normalized.startswith("DEFAULT_"):
+                raise ValueError(
+                    f"{field_name} cannot use the reserved 'DEFAULT' or "
+                    f"'DEFAULT_*' identifier (got: {value!r}). These "
+                    f"identifiers are reserved for global/default "
+                    f"configurations and cannot be registered as scoped "
+                    f"use cases."
+                )
+
+    @staticmethod
+    def validate_use_case_config_entry(entry: Any) -> tuple[str, str]:
+        """Validate a use-case configuration entry structure and IDs.
+
+        Validates that the entry is a dictionary with required keys
+        (businessUnitId, useCaseId) and that the IDs meet all requirements.
+
+        Args:
+            entry: A use-case config entry (expected to be a dict)
+
+        Returns:
+            Tuple of (business_unit_id, use_case_id) as validated strings
+
+        Raises:
+            ValueError: If entry structure or IDs are invalid
+        """
+        if not isinstance(entry, dict):
+            raise ValueError("Each UseCaseConfigs entry must be an object")
+
+        missing = [k for k in ("businessUnitId", "useCaseId") if k not in entry]
+        if missing:
+            raise ValueError(
+                f"UseCaseConfigs entry missing required keys: {', '.join(missing)}"
+            )
+
+        bu_id = entry["businessUnitId"]
+        uc_id = entry["useCaseId"]
+
+        if not isinstance(bu_id, str) or not isinstance(uc_id, str):
+            raise ValueError("businessUnitId and useCaseId must be strings")
+
+        # Validate IDs using shared validation logic
+        ConfigurationManager.validate_use_case_ids(bu_id, uc_id)
+
+        return bu_id, uc_id
+
+    def save_use_case_configuration(
+        self,
+        business_unit_id: str,
+        use_case_id: str,
+        config_type: str,
+        config_data: Dict[str, Any],
+    ) -> None:
+        """
+        Save a use-case-scoped configuration to DynamoDB.
+
+        Args:
+            business_unit_id: Business unit identifier
+            use_case_id: Use case identifier
+            config_type: Configuration type (Default or Custom)
+            config_data: Configuration data (sparse delta dict)
+        """
+
+        if not isinstance(config_data, dict):
+            raise ValueError(
+                f"config_data must be a dictionary (got {type(config_data).__name__}). "
+                "Methods save_use_case_configuration -> save_raw_configuration -> "
+                "_stringify_values require a dictionary to process configuration values."
+            )
+        self.validate_use_case_ids(business_unit_id, use_case_id)
+        uc_key = self._use_case_config_key(business_unit_id, use_case_id, config_type)
+        self.save_raw_configuration(uc_key, config_data)
+        logger.info(
+            f"Saved use-case configuration: {business_unit_id}/{use_case_id} ({config_type})"
+        )
+
+    @overload
+    def list_use_cases(
+        self, *, include_version: Literal[False] = False
+    ) -> list[Dict[str, Any]]: ...
+
+    @overload
+    def list_use_cases(
+        self, *, include_version: Literal[True]
+    ) -> tuple[list[Dict[str, Any]], int]: ...
+
+    def list_use_cases(
+        self, *, include_version: bool = False
+    ) -> Union[list[Dict[str, Any]], tuple[list[Dict[str, Any]], int]]:
+        """
+        List all registered use cases from the UseCaseRegistry.
+
+        Args:
+            include_version: If True, return a tuple of (use_cases, version)
+                for optimistic locking support. Defaults to False for
+                backward compatibility.
+
+        Returns:
+            If include_version is False: list of use case entries.
+            If include_version is True: tuple of (use_cases, version).
+            Each entry contains businessUnitId, useCaseId, name, and description.
+            Returns empty list (or ([], 0)) if no registry exists.
+        """
+        try:
+            response = self.table.get_item(Key={"Configuration": USE_CASE_REGISTRY_KEY})
+            item = response.get("Item")
+            if item is None:
+                return ([], 0) if include_version else []
+
+            registry_json = item.get("use_cases", "[]")
+            version = item.get("version", 0)
+            try:
+                use_cases = (
+                    json.loads(registry_json)
+                    if isinstance(registry_json, str)
+                    else registry_json
+                )
+            except json.JSONDecodeError as e:
+                logger.error(f"Malformed use_cases JSON in registry: {e}")
+                return ([], 0) if include_version else []
+
+            # Guard against registry data that is not a list so that
+            # downstream callers (e.g. register_use_case) can safely
+            # assume list semantics.
+            if not isinstance(use_cases, list):
+                logger.warning(
+                    "use_cases registry value is not a list (got %s); "
+                    "treating as empty registry",
+                    type(use_cases).__name__,
+                )
+                return ([], 0) if include_version else []
+
+            # Filter out non-dict entries to ensure downstream callers
+            # can safely call .get() on every item.
+            required_keys = {"businessUnitId", "useCaseId"}
+            valid_entries = []
+            non_dict_dropped = 0
+            missing_key_dropped = 0
+            for uc in use_cases:
+                if not isinstance(uc, dict):
+                    non_dict_dropped += 1
+                    continue
+                missing = required_keys - uc.keys()
+                if missing:
+                    missing_key_dropped += 1
+                    logger.warning(
+                        "Dropped use-case entry missing required keys %s: %s",
+                        sorted(missing),
+                        uc,
+                    )
+                    continue
+                valid_entries.append(uc)
+
+            if non_dict_dropped:
+                bad_types = {type(uc).__name__ for uc in use_cases if not isinstance(uc, dict)}
+                logger.warning(
+                    "Dropped %d non-dict entries from use_cases registry "
+                    "(types: %s)",
+                    non_dict_dropped,
+                    ", ".join(sorted(bad_types)),
+                )
+
+            return (valid_entries, version) if include_version else valid_entries
+        except ClientError as e:
+            logger.error(f"Error reading use case registry: {e}")
+            raise
+
+    def register_use_case(
+        self,
+        business_unit_id: str,
+        use_case_id: str,
+        name: str,
+        description: str = "",
+    ) -> None:
+        """
+        Register a new use case in the UseCaseRegistry.
+
+        If a use case with the same business_unit_id and use_case_id already exists,
+        it is updated with the new name and description.
+
+        Args:
+            business_unit_id: Business unit identifier
+            use_case_id: Use case identifier
+            name: Human-readable name
+            description: Optional description
+
+        Raises:
+            ValueError: If business_unit_id or use_case_id are empty or contain
+                forbidden characters (e.g. '#')
+        """
+        # Validate identifiers before persisting to avoid creating keys
+        # that break _use_case_config_key or downstream S3 key construction
+        self.validate_use_case_ids(business_unit_id, use_case_id)
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            use_cases, version = self.list_use_cases(include_version=True)
+
+            # Update existing or append new
+            entry = {
+                "businessUnitId": business_unit_id,
+                "useCaseId": use_case_id,
+                "name": name,
+                "description": description,
+            }
+
+            updated = False
+            for i, uc in enumerate(use_cases):
+                if (
+                    uc.get("businessUnitId") == business_unit_id
+                    and uc.get("useCaseId") == use_case_id
+                ):
+                    use_cases[i] = entry
+                    updated = True
+                    break
+
+            if not updated:
+                use_cases.append(entry)
+
+            new_version = version + 1
+
+            # Write back to DynamoDB with optimistic locking via ConditionExpression
+            try:
+                if version == 0:
+                    # First write: item may not exist yet or has no version attribute
+                    self.table.put_item(
+                        Item={
+                            "Configuration": USE_CASE_REGISTRY_KEY,
+                            "use_cases": json.dumps(use_cases),
+                            "version": new_version,
+                        },
+                        ConditionExpression="attribute_not_exists(version) OR version = :v",
+                        ExpressionAttributeValues={":v": version},
+                    )
+                else:
+                    self.table.put_item(
+                        Item={
+                            "Configuration": USE_CASE_REGISTRY_KEY,
+                            "use_cases": json.dumps(use_cases),
+                            "version": new_version,
+                        },
+                        ConditionExpression="version = :v",
+                        ExpressionAttributeValues={":v": version},
+                    )
+                logger.info(
+                    f"Registered use case: {business_unit_id}/{use_case_id} ({name})"
+                )
+                return
+            except ClientError as e:
+                if (
+                    e.response.get("Error", {}).get("Code")
+                    == "ConditionalCheckFailedException"
+                ):
+                    logger.warning(
+                        f"Concurrent modification detected on attempt {attempt + 1}/{max_retries}, "
+                        f"retrying with fresh data..."
+                    )
+                    continue
+                raise
+
+        raise UseCaseRegistrationError(
+            f"Failed to register use case after {max_retries} retries due to concurrent modifications"
+        )
+
+    def delete_use_case(
+        self,
+        business_unit_id: str,
+        use_case_id: str,
+        max_retries: int = 3,
+    ) -> bool:
+        """
+        Delete a use case: remove it from the registry and clean up config records.
+
+        This performs:
+        1. Remove the use case entry from the UseCaseRegistry (with optimistic locking)
+        2. Best-effort cleanup of UC Default/Custom/Schema configuration records
+
+        Args:
+            business_unit_id: Business unit identifier
+            use_case_id: Use case identifier
+            max_retries: Maximum optimistic-lock retries for the registry update
+
+        Returns:
+            True if the use case was found and removed, False if it was not in the registry.
+
+        Raises:
+            UseCaseRegistrationError: If the registry update fails after max_retries
+                due to concurrent modifications.
+            ClientError: If a DynamoDB operation fails for a non-concurrency reason.
+        """
+        self.validate_use_case_ids(business_unit_id, use_case_id)
+
+        for attempt in range(max_retries):
+            use_cases, version = self.list_use_cases(include_version=True)
+
+            updated = [
+                uc
+                for uc in use_cases
+                if not (
+                    uc.get("businessUnitId") == business_unit_id
+                    and uc.get("useCaseId") == use_case_id
+                )
+            ]
+
+            if len(updated) == len(use_cases):
+                logger.info(
+                    f"Use case {business_unit_id}/{use_case_id} not found in registry"
+                )
+                return False
+
+            new_version = version + 1
+
+            try:
+                condition_expr = (
+                    "attribute_not_exists(version) OR version = :v"
+                    if version == 0
+                    else "version = :v"
+                )
+                self.table.put_item(
+                    Item={
+                        "Configuration": USE_CASE_REGISTRY_KEY,
+                        "use_cases": json.dumps(updated),
+                        "version": new_version,
+                    },
+                    ConditionExpression=condition_expr,
+                    ExpressionAttributeValues={":v": version},
+                )
+                logger.info(
+                    f"Removed {business_unit_id}/{use_case_id} from use-case registry"
+                )
+                break
+            except ClientError as e:
+                if (
+                    e.response.get("Error", {}).get("Code")
+                    == "ConditionalCheckFailedException"
+                ):
+                    logger.warning(
+                        f"Concurrent modification detected on attempt "
+                        f"{attempt + 1}/{max_retries}, retrying..."
+                    )
+                    continue
+                raise
+        else:
+            raise UseCaseRegistrationError(
+                f"Failed to delete use case {business_unit_id}/{use_case_id} "
+                f"after {max_retries} retries due to concurrent modifications"
+            )
+
+        # Clean up associated configuration records (best-effort)
+        for config_type in (CONFIG_TYPE_DEFAULT, CONFIG_TYPE_CUSTOM, CONFIG_TYPE_SCHEMA):
+            try:
+                key = self._use_case_config_key(
+                    business_unit_id, use_case_id, config_type
+                )
+                self.delete_configuration(key)
+            except ClientError as e:
+                logger.warning(
+                    f"Could not delete {config_type} config for "
+                    f"{business_unit_id}/{use_case_id}: {e}"
+                )
+
+        logger.info(
+            f"Deleted use case {business_unit_id}/{use_case_id} and its configuration records"
+        )
+        return True
+
+    def handle_update_use_case_configuration(
+        self,
+        business_unit_id: str,
+        use_case_id: str,
+        custom_config: Union[str, Dict[str, Any]],
+    ) -> bool:
+        """
+        Handle a use-case-scoped configuration update (mirrors handle_update_custom_configuration).
+
+        Merges deltas into the existing UC Custom config, validates against
+        Global Default + UC Default + UC Custom, and stores sparse deltas.
+
+        Args:
+            business_unit_id: Business unit identifier
+            use_case_id: Use case identifier
+            custom_config: Configuration deltas as JSON string or dict
+
+        Returns:
+            True on success
+        """
+        from copy import deepcopy
+
+        # Validate identifiers before any persistence
+        self.validate_use_case_ids(business_unit_id, use_case_id)
+
+        # Parse input
+        if isinstance(custom_config, str):
+            config_dict = json.loads(custom_config)
+        else:
+            config_dict = custom_config if custom_config else {}
+
+        # Remove legacy pricing field (pricing is stored separately)
+        if isinstance(config_dict, dict):
+            config_dict.pop("pricing", None)
+
+        # Validate that parsed config is a dict (apply_delta_with_deletions requires it)
+        if not isinstance(config_dict, dict):
+            raise ValueError(
+                f"custom_config for {business_unit_id}/{use_case_id} must be a "
+                f"JSON object (dict), got {type(config_dict).__name__}"
+            )
+
+        # Extract special flags
+        reset_to_default = config_dict.pop("resetToDefault", False)
+
+        uc_custom_key = self._use_case_config_key(
+            business_unit_id, use_case_id, CONFIG_TYPE_CUSTOM
+        )
+
+        # Handle reset — delete UC Custom so UC Default + Global Default apply
+        if reset_to_default:
+            try:
+                self.delete_configuration(uc_custom_key)
+            except Exception:
+                logger.debug(
+                    f"UC Custom config not found or already deleted for "
+                    f"{business_unit_id}/{use_case_id}"
+                )
+            logger.info(f"Reset use-case Custom for {business_unit_id}/{use_case_id}")
+            return True
+
+        if not config_dict:
+            return True
+
+        # Get existing UC Custom (raw sparse delta)
+        existing_custom = self.get_raw_configuration(uc_custom_key) or {}
+
+        # Remove legacy pricing field from existing custom as well
+        if isinstance(existing_custom, dict):
+            existing_custom.pop("pricing", None)
+
+        # Merge deltas
+        apply_delta_with_deletions(existing_custom, config_dict)
+
+        # Validate: Global Default + UC Default + UC Custom must produce valid IDPConfig
+        global_default = self.get_configuration(CONFIG_TYPE_DEFAULT)
+        if global_default and isinstance(global_default, IDPConfig):
+            merged = global_default.model_dump(mode="python")
+
+            uc_default_key = self._use_case_config_key(
+                business_unit_id, use_case_id, CONFIG_TYPE_DEFAULT
+            )
+            uc_default_dict = self.get_raw_configuration(uc_default_key)
+            if uc_default_dict:
+                merged = deepcopy(merged)
+                deep_update(merged, uc_default_dict)
+
+            validation_dict = deepcopy(merged)
+            deep_update(validation_dict, existing_custom)
+            IDPConfig(**validation_dict)  # raises ValidationError if invalid
+
+            # Auto-cleanup: strip values matching the effective base (Global + UC Default)
+            strip_matching_defaults(existing_custom, merged)
+
+        if existing_custom:
+            self.save_raw_configuration(uc_custom_key, existing_custom)
+        else:
+            try:
+                self.delete_configuration(uc_custom_key)
+            except Exception:
+                logger.debug(
+                    "UC Custom config not found or already deleted for "
+                    f"{business_unit_id}/{use_case_id}"
+                )
+        logger.info(f"Updated use-case Custom for {business_unit_id}/{use_case_id}")
+        return True
+
     # ===== Private Methods =====
 
     def _sync_custom_with_new_default_sparse(
@@ -662,9 +1297,8 @@ class ConfigurationManager:
         Returns:
             New sparse custom dict with only fields that differ from new_default
         """
-        from copy import deepcopy
-
-        old_default_dict = old_default.model_dump(mode="python")
+        # old_default kept in signature for potential future diff logic
+        _ = old_default
         new_default_dict = new_default.model_dump(mode="python")
 
         # Start with a copy of existing Custom deltas

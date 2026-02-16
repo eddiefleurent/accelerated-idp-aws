@@ -9,10 +9,14 @@ as it moves through the processing pipeline.
 """
 
 import json
+import logging
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
+
+_logger = logging.getLogger(__name__)
 
 
 class Status(Enum):
@@ -274,6 +278,10 @@ class Document:
     summarization_result: Any = None  # Holds the DocumentSummarizationResult object
     errors: List[str] = field(default_factory=list)
 
+    # Use-case routing
+    business_unit_id: Optional[str] = None
+    use_case_id: Optional[str] = None
+
     # HITL metadata
     hitl_metadata: List[HitlMetadata] = field(default_factory=list)
     hitl_status: Optional[str] = None  # PendingReview, InProgress, Completed, Skipped
@@ -303,6 +311,8 @@ class Document:
             "errors": self.errors,
             "metering": self.metering,
             "trace_id": self.trace_id,
+            "business_unit_id": self.business_unit_id,
+            "use_case_id": self.use_case_id,
             # We don't include evaluation_result or summarization_result in the dict since they're objects
         }
 
@@ -386,6 +396,8 @@ class Document:
             metering=data.get("metering", {}),
             trace_id=data.get("trace_id"),
             errors=data.get("errors", []),
+            business_unit_id=data.get("business_unit_id"),
+            use_case_id=data.get("use_case_id"),
         )
 
         # Convert status from string to enum
@@ -455,10 +467,54 @@ class Document:
 
     @classmethod
     def from_s3_event(cls, event: Dict[str, Any], output_bucket: str) -> "Document":
-        """Create a Document from an S3 event."""
+        """Create a Document from an S3 event.
+
+        If the S3 key follows the convention {business_unit}/{use_case}/{filename},
+        the business_unit_id and use_case_id are parsed from the key path.
+        """
         input_bucket = event.get("detail", {}).get("bucket", {}).get("name", "")
-        input_key = event.get("detail", {}).get("object", {}).get("key", "")
+        raw_key = event.get("detail", {}).get("object", {}).get("key", "")
         initial_event_time = event.get("time", "")
+
+        # URL-decode the S3 key (S3 events encode '+' and special characters)
+        input_key = urllib.parse.unquote_plus(raw_key)
+
+        # Parse use-case routing from S3 key: {bu}/{uc}/{filename...}
+        # Split the raw (still-encoded) key first so that encoded slashes (%2F)
+        # within BU/UC names are preserved, then URL-decode each segment individually.
+        business_unit_id = None
+        use_case_id = None
+        parts = raw_key.split("/", 2)
+        if len(parts) >= 3:
+            candidate_bu = urllib.parse.unquote_plus(parts[0])
+            candidate_uc = urllib.parse.unquote_plus(parts[1])
+
+            # Additional guard: reject reserved identifiers that would
+            # collide with global/default configuration keys
+            def _is_reserved(v: str) -> bool:
+                normalized = v.upper().lstrip("_")
+                return normalized == "DEFAULT" or normalized.startswith("DEFAULT_")
+
+            if (
+                candidate_bu
+                and candidate_uc
+                and "#" not in candidate_bu
+                and "#" not in candidate_uc
+                and "/" not in candidate_bu
+                and "/" not in candidate_uc
+                and not _is_reserved(candidate_bu)
+                and not _is_reserved(candidate_uc)
+            ):
+                business_unit_id = candidate_bu
+                use_case_id = candidate_uc
+            else:
+                _logger.warning(
+                    "S3 key '%s' has 3+ segments but candidate BU/UC pair "
+                    "('%s'/'%s') is invalid for use-case routing; treating as non-routed",
+                    input_key,
+                    candidate_bu,
+                    candidate_uc,
+                )
 
         return cls(
             id=input_key,
@@ -467,6 +523,8 @@ class Document:
             output_bucket=output_bucket,
             initial_event_time=initial_event_time,
             status=Status.QUEUED,
+            business_unit_id=business_unit_id,
+            use_case_id=use_case_id,
         )
 
     def to_json(self) -> str:
