@@ -73,6 +73,12 @@ class DocumentAppSyncService:
         if document.trace_id:
             input_data["TraceId"] = document.trace_id
 
+        # Add use-case routing fields for UseCaseIndex GSI
+        if document.business_unit_id:
+            input_data["BusinessUnitId"] = document.business_unit_id
+        if document.use_case_id:
+            input_data["UseCaseId"] = document.use_case_id
+
         return input_data
 
     def _document_to_update_input(self, document: Document) -> Dict[str, Any]:
@@ -259,6 +265,12 @@ class DocumentAppSyncService:
             summary_report_uri=appsync_data.get("SummaryReportUri"),
             trace_id=appsync_data.get("TraceId"),
         )
+
+        # Map use-case routing fields from GSI
+        if appsync_data.get("BusinessUnitId"):
+            doc.business_unit_id = appsync_data["BusinessUnitId"]
+        if appsync_data.get("UseCaseId"):
+            doc.use_case_id = appsync_data["UseCaseId"]
 
         # Handle rule validation result URI if present
         rule_validation_uri = appsync_data.get("RuleValidationResultUri")
