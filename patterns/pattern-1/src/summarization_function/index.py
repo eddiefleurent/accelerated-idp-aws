@@ -75,8 +75,19 @@ def handler(event, context):
         logger.info(f"Updating document status to {document.status}")
         document_service.update_document(document)
         
-        # Load configuration and create the summarization service
-        config = get_config(as_model=True)
+        # Load configuration with use-case scoping when available
+        use_case_context = event.get("use_case_context") or {}
+        if not isinstance(use_case_context, dict):
+            logger.warning(
+                "use_case_context is not a dict (got %s), falling back to empty dict",
+                type(use_case_context).__name__,
+            )
+            use_case_context = {}
+        config = get_config(
+            as_model=True,
+            business_unit_id=use_case_context.get("business_unit_id") or document.business_unit_id,
+            use_case_id=use_case_context.get("use_case_id") or document.use_case_id,
+        )
         summarization_service = summarization.SummarizationService(
             config=config
         )        

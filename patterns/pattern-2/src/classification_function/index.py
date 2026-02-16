@@ -35,14 +35,51 @@ def handler(event, context):
     start_time = time.time()  # Capture start time for Lambda metering
     logger.info(f"Event: {json.dumps(event)}")
     
-    # Load configuration
-    config = get_config(as_model=True)
-    # Use default=str to handle Decimal and other non-serializable types
-    logger.info(f"Config: {json.dumps(config.model_dump(), default=str)}")
-    
     # Extract document from the OCR result - handle both compressed and uncompressed
     working_bucket = os.environ.get('WORKING_BUCKET')
     document = Document.load_document(event["OCRResult"]["document"], working_bucket, logger)
+
+    # Load configuration - prefer use_case_context, fall back to document fields
+    use_case_context = event.get("use_case_context", None)
+    if use_case_context is None:
+        use_case_context = {}
+    elif not isinstance(use_case_context, dict):
+        logger.warning(
+            "use_case_context is not a dict (got %s: %r), falling back to empty dict",
+            type(use_case_context).__name__,
+            use_case_context,
+        )
+        use_case_context = {}
+
+    # Only honor use_case_context if it contains both required keys (use `is None`
+    # so that empty-string IDs are preserved); a partial context would cause mixed
+    # lookups in get_config.
+    if use_case_context and (
+        use_case_context.get("business_unit_id") is None
+        or use_case_context.get("use_case_id") is None
+    ):
+        logger.warning(
+            "use_case_context is partial (got %s), ignoring and falling back to document fields",
+            use_case_context,
+        )
+        use_case_context = {}
+
+    effective_business_unit_id = use_case_context.get("business_unit_id")
+    if effective_business_unit_id is None:
+        effective_business_unit_id = document.business_unit_id
+    effective_use_case_id = use_case_context.get("use_case_id")
+    if effective_use_case_id is None:
+        effective_use_case_id = document.use_case_id
+    config = get_config(
+        as_model=True,
+        business_unit_id=effective_business_unit_id,
+        use_case_id=effective_use_case_id,
+    )
+    logger.info(
+        "Config loaded for business_unit_id=%s use_case_id=%s",
+        effective_business_unit_id,
+        effective_use_case_id,
+    )
     
     # Log loaded document for troubleshooting
     logger.info(f"Loaded document - ID: {document.id}, input_key: {document.input_key}")
@@ -52,9 +89,13 @@ def handler(event, context):
     logger.info(f"Full document content: {json.dumps(document.to_dict(), default=str)}")
 
     # X-Ray annotations
-    xray_recorder.put_annotation('document_id', {document.id})
+    xray_recorder.put_annotation('document_id', document.id)
     xray_recorder.put_annotation('processing_stage', 'classification')
-    
+    if effective_business_unit_id:
+        xray_recorder.put_annotation('business_unit_id', effective_business_unit_id)
+    if effective_use_case_id:
+        xray_recorder.put_annotation('use_case_id', effective_use_case_id)
+
     # Intelligent Classification detection: Skip if pages already have classifications
     pages_with_classification = 0
     for page in document.pages.values():

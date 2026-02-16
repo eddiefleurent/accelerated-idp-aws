@@ -23,10 +23,17 @@ logging.getLogger("idp_common.bedrock.client").setLevel(
 s3_client = boto3.client("s3")
 
 
-def is_hitl_enabled():
-    """Check if HITL is enabled from configuration."""
+def is_hitl_enabled(config=None):
+    """Check if HITL is enabled from configuration.
+
+    Args:
+        config: Optional pre-loaded IDPConfig instance. When provided, uses
+            the scoped config directly instead of loading global settings.
+            This ensures use-case-level overrides are honored.
+    """
     try:
-        config = get_config(as_model=True)
+        if config is None:
+            config = get_config(as_model=True)
         return config.assessment.hitl_enabled
     except Exception as e:
         logger.warning(f"Failed to get HITL config: {e}")
@@ -46,7 +53,14 @@ def handler(event, context):
     """
     logger.info(f"Processing event: {json.dumps(event)}")
 
-    config = get_config(as_model=True)
+    use_case_context = event.get("use_case_context")
+    if not isinstance(use_case_context, dict):
+        if use_case_context is not None:
+            logger.warning(
+                "use_case_context is not a dict (got %s), falling back to empty dict",
+                type(use_case_context).__name__,
+            )
+        use_case_context = {}
     # Get the base document from the original classification result - handle both compressed and uncompressed
     working_bucket = os.environ.get("WORKING_BUCKET")
     classification_document_data = event.get("ClassificationResult", {}).get(
@@ -54,6 +68,22 @@ def handler(event, context):
     )
     document = Document.load_document(
         classification_document_data, working_bucket, logger
+    )
+    # Load config after document so we can fall back to document-level BU/UC
+    resolved_bu = use_case_context.get("business_unit_id") or document.business_unit_id
+    resolved_uc = use_case_context.get("use_case_id") or document.use_case_id
+    if (resolved_bu is None) != (resolved_uc is None):
+        logger.warning(
+            "Partial use_case_context detected (bu=%s, uc=%s); falling back to global config",
+            resolved_bu,
+            resolved_uc,
+        )
+        resolved_bu = None
+        resolved_uc = None
+    config = get_config(
+        as_model=True,
+        business_unit_id=resolved_bu,
+        use_case_id=resolved_uc,
     )
 
     extraction_results = event.get("ExtractionResults", [])
@@ -80,7 +110,6 @@ def handler(event, context):
     # Clear sections list to rebuild from extraction results
     document.sections = []
     validation_errors = []
-    validation_errors = []
     hitl_triggered = False
 
     # Combine all section results
@@ -97,7 +126,7 @@ def handler(event, context):
                 logger.info(
                     f"section.confidence_threshold_alerts: {section.confidence_threshold_alerts}"
                 )
-                hitl_enabled = is_hitl_enabled()
+                hitl_enabled = is_hitl_enabled(config)
                 logger.info(f"is_hitl_enabled: {hitl_enabled}")
                 document.sections.append(section)
 

@@ -136,6 +136,13 @@ Parameters:
     Type: String
     Description: "Pattern-2 source zipfile object name"
 
+  UseCaseConfigs:
+    Type: String
+    Default: ""
+    Description: "JSON array of use case configurations for multi-use-case document handling"
+    AllowedPattern: '^$|^\s*\[[\s\S]*\]\s*$'
+    ConstraintDescription: "Must be empty or a JSON array."
+
 Conditions:
   HasGuardrailConfig:
     !And [
@@ -149,6 +156,7 @@ Conditions:
   HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, ""]]
   HasAppSyncApi: !Not [!Equals [!Ref AppSyncApiArn, ""]]
   IsECRImageScanningEnabled: !Equals [!Ref EnableECRImageScanning, "true"]
+  HasUseCaseConfigs: !Not [!Equals [!Ref UseCaseConfigs, ""]]
 
 Resources:
   DockerBuildRole:
@@ -1820,6 +1828,10 @@ Resources:
       ConfigLibraryHash: !Ref ConfigLibraryHash
       CustomClassificationModelARN: !Ref CustomClassificationModelARN
       CustomExtractionModelARN: !Ref CustomExtractionModelARN
+      UseCaseConfigs: !If
+        - HasUseCaseConfigs
+        - !Ref UseCaseConfigs
+        - !Ref AWS::NoValue
 
   OCRFunction:
     Type: AWS::Serverless::Function
@@ -1853,7 +1865,7 @@ Resources:
         Command:
           - "index.handler"
       Timeout: 900
-      MemorySize: 4096
+      MemorySize: 3008
       Tracing: Active
       Environment:
         Variables:
@@ -1961,7 +1973,7 @@ Resources:
         Command:
           - "index.handler"
       Timeout: 900
-      MemorySize: 4096
+      MemorySize: 3008
       Tracing: Active
       Environment:
         Variables:
@@ -2316,7 +2328,7 @@ Resources:
         Command:
           - "index.handler"
       Timeout: 900
-      MemorySize: 4096
+      MemorySize: 3008
       Environment:
         Variables:
           METRIC_NAMESPACE: !Ref StackName
@@ -2403,7 +2415,7 @@ Resources:
         Command:
           - "index.handler"
       Timeout: 900
-      MemorySize: 4096
+      MemorySize: 3008
       Environment:
         Variables:
           METRIC_NAMESPACE: !Ref StackName
@@ -2624,7 +2636,7 @@ Resources:
       # Handler: index.handler
       # Runtime: python3.12
       Timeout: 900
-      MemorySize: 4096
+      MemorySize: 3008
       Environment:
         Variables:
           METRIC_NAMESPACE: !Ref StackName
@@ -2734,7 +2746,7 @@ Resources:
       # Handler: index.handler
       # Runtime: python3.12
       Timeout: 900
-      MemorySize: 4096
+      MemorySize: 3008
       Environment:
         Variables:
           METRIC_NAMESPACE: !Ref StackName
@@ -2811,123 +2823,6 @@ Resources:
               Action:
                 - lambda:InvokeFunction
               Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${SaveReportingFunctionName}"
-
-  RuleValidationOrchestrationFunctionLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      KmsKeyId: !Ref CustomerManagedEncryptionKeyArn
-      LogGroupName: !Sub "/${AWS::StackName}/lambda/RuleValidationOrchestrationFunction"
-      RetentionInDays: !Ref LogRetentionDays
-
-  RuleValidationFunction:
-    Type: AWS::Serverless::Function
-    DependsOn: DockerBuildRun
-    Metadata:
-      SkipBuild: True
-      cfn_nag:
-        rules_to_suppress:
-          - id: W11
-            reason: "Cloudwatch does not support resource-level permissions"
-          - id: W89
-            reason: "This Lambda function does not require VPC access as it only interacts with AWS services via AWS APIs"
-          - id: W92
-            reason: "Function does not require concurrent execution limits as it is designed to scale based on demand"
-    # checkov:skip=CKV_AWS_116: "DLQ not required for this function as StepFunctions will handle retries"
-    # checkov:skip=CKV_AWS_173: "Environment variables do not contain sensitive data - only configuration values like feature flags and non-sensitive settings"
-    # checkov:skip=CKV_AWS_117: "Function does not require VPC access as it only interacts with AWS services via APIs"
-    # checkov:skip=CKV_AWS_115: "Function does not require reserved concurrency as it scales based on demand"
-    Properties:
-      PermissionsBoundary:
-        !If [
-          HasPermissionsBoundary,
-          !Ref PermissionsBoundaryArn,
-          !Ref AWS::NoValue,
-        ]
-      # Container configuration
-      PackageType: Image
-      ImageUri: !Sub "${ECRRepository.RepositoryUri}:rule-validation-function-${ImageVersion}"
-      Architectures:
-        - arm64
-      ImageConfig:
-        Command:
-          - "index.handler"
-      # Local testing configuration (commented for deployment)
-      # CodeUri: src/rule-validation-function/
-      # Handler: index.handler
-      # Runtime: python3.12
-      Timeout: 900
-      MemorySize: 4096
-      Environment:
-        Variables:
-          METRIC_NAMESPACE: !Ref StackName
-          CONFIGURATION_TABLE_NAME: !Ref ConfigurationTable
-          GUARDRAIL_ID_AND_VERSION:
-            !If [
-              HasGuardrailConfig,
-              !Sub "${BedrockGuardrailId}:${BedrockGuardrailVersion}",
-              "",
-            ]
-          LOG_LEVEL: !Ref LogLevel
-          APPSYNC_API_URL: !Ref AppSyncApiUrl
-          TRACKING_TABLE: !Ref TrackingTable
-          DOCUMENT_TRACKING_MODE: !If [HasAppSyncApi, "appsync", "dynamodb"]
-          WORKING_BUCKET: !Ref WorkingBucket
-      LoggingConfig:
-        LogGroup: !Ref RuleValidationFunctionLogGroup
-      Policies:
-        - AWSLambdaBasicExecutionRole
-        - !Ref LambdaECRAccessPolicy
-        - S3ReadPolicy:
-            BucketName: !Ref InputBucket
-        - S3CrudPolicy:
-            BucketName: !Ref OutputBucket
-        - S3CrudPolicy:
-            BucketName: !Ref WorkingBucket
-        - DynamoDBCrudPolicy:
-            TableName: !Ref ConfigurationTable
-        - DynamoDBCrudPolicy:
-            TableName: !Ref TrackingTable
-        - Statement:
-            - Effect: Allow
-              Action: cloudwatch:PutMetricData
-              Resource: "*"
-            - Effect: Allow
-              Action:
-                - kms:Encrypt
-                - kms:Decrypt
-                - kms:ReEncrypt*
-                - kms:GenerateDataKey*
-                - kms:DescribeKey
-              Resource: !Ref CustomerManagedEncryptionKeyArn
-            # AppSync permissions for updating document status (only if AppSync API is available)
-            - !If
-              - HasAppSyncApi
-              - Effect: Allow
-                Action:
-                  - appsync:GraphQL
-                Resource:
-                  - !Sub "${AppSyncApiArn}/types/Mutation/*"
-              - !Ref AWS::NoValue
-            - Effect: Allow
-              Action:
-                - bedrock:InvokeModel
-                - bedrock:InvokeModelWithResponseStream
-              Resource:
-                - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
-                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
-            - !If
-              - HasGuardrailConfig
-              - Effect: Allow
-                Action: bedrock:ApplyGuardrail
-                Resource: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/${BedrockGuardrailId}"
-              - !Ref AWS::NoValue
-
-  RuleValidationFunctionLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      KmsKeyId: !Ref CustomerManagedEncryptionKeyArn
-      LogGroupName: !Sub "/${AWS::StackName}/lambda/RuleValidationFunction"
-      RetentionInDays: !Ref LogRetentionDays
 
   RuleValidationOrchestrationFunctionLogGroup:
     Type: AWS::Logs::LogGroup

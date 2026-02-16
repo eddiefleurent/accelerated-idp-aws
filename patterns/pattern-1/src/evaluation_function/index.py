@@ -158,6 +158,14 @@ def handler(event, context):
     actual_document = None
     start_time = time.time()
     working_bucket = os.environ.get('WORKING_BUCKET')
+    use_case_context = event.get("use_case_context")
+    if not isinstance(use_case_context, dict):
+        if use_case_context is not None:
+            logger.warning(
+                "use_case_context is not a dict (got %s), falling back to empty dict",
+                type(use_case_context).__name__,
+            )
+        use_case_context = {}
     
     try:
         logger.info(f"Starting evaluation process: {json.dumps(event)}")
@@ -165,8 +173,16 @@ def handler(event, context):
         # Extract document from event
         actual_document = extract_document_from_event(event)
         
+        # Resolve effective BU/UC: prefer event context, fall back to document fields
+        resolved_bu = use_case_context.get("business_unit_id") or actual_document.business_unit_id
+        resolved_uc = use_case_context.get("use_case_id") or actual_document.use_case_id
+        
         # Load configuration and check if evaluation is enabled
-        config = get_config(as_model=True)
+        config = get_config(
+            as_model=True,
+            business_unit_id=resolved_bu,
+            use_case_id=resolved_uc,
+        )
         
         if not config.evaluation.enabled:
             logger.info("Evaluation is disabled in configuration, skipping evaluation")
