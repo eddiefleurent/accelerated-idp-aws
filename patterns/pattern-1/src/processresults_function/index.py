@@ -32,10 +32,17 @@ ssm_client = boto3.client("ssm")
 bedrock_client = boto3.client("bedrock-data-automation")
 
 
-def is_hitl_enabled():
-    """Check if HITL is enabled from configuration."""
+def is_hitl_enabled(config=None):
+    """Check if HITL is enabled from configuration.
+
+    Args:
+        config: Optional pre-loaded IDPConfig instance. When provided, uses
+            the scoped config directly instead of loading global settings.
+            This ensures use-case-level overrides are honored.
+    """
     try:
-        config = get_config(as_model=True)
+        if config is None:
+            config = get_config(as_model=True)
         hitl_enabled = config.assessment.hitl_enabled
         logger.info(f"HITL enabled check: {hitl_enabled}")
         return hitl_enabled
@@ -418,7 +425,7 @@ def extract_page_from_multipage_json(raw_json, page_index, confidence_threshold=
     # Update metadata to reflect single page (keep 0-based indexing for consistency)
     if "metadata" in single_page_json:
         single_page_json["metadata"]["start_page_index"] = page_index  # 0-based
-        single_page_json["metadata"]["end_page_index"] = page_index    # 0-based
+        single_page_json["metadata"]["end_page_index"] = page_index  # 0-based
         single_page_json["metadata"]["number_of_pages"] = 1
 
     # Include document level info
@@ -772,10 +779,11 @@ def process_segments(
     confidence_threshold: float,
     execution_id: str,
     document,
+    config,
 ):
     """
     Process each segment, extract key-value details, and invoke human review if needed.
-    
+
     Args:
         confidence_threshold: Threshold for both creating alerts and triggering HITL
     """
@@ -790,7 +798,8 @@ def process_segments(
         )
 
     now = datetime.datetime.now().isoformat()
-    hitl_triggered = False
+    # TODO: When HITL integration is ready, add per-segment hitl_triggered
+    # and std_hitl tracking here instead of the scattered assignments below.
     overall_hitl_triggered = False
 
     for record_number, segment in enumerate(segment_metadata, start=1):
@@ -841,7 +850,7 @@ def process_segments(
 
             # Check if any key-value or blueprint confidence is below threshold
             # Use confidence_threshold_alerts to determine if HITL should be triggered
-            if is_hitl_enabled():
+            if is_hitl_enabled(config):
                 low_confidence = (
                     len(confidence_threshold_alerts) > 0
                     or float(bp_confidence) < confidence_threshold
@@ -876,17 +885,11 @@ def process_segments(
             )
 
             if low_confidence:
-                hitl_triggered = low_confidence
                 metrics.put_metric("HITLTriggered", 1)
                 overall_hitl_triggered = True
                 # HITL review will be handled via portal, not A2I
                 item.update({"hitl_corrected_result": custom_decimal_output})
         else:
-            if is_hitl_enabled():
-                std_hitl = "true"
-                # std_hitl = None # HITL for standard output blueprint match is disabled until we have option to choose Blueprint in A2I
-            else:
-                std_hitl = None
             # Process standard output if no custom output match
             std_bucket, std_key = parse_s3_path(segment["standard_output_path"])
             std_output = download_decimal(std_bucket, std_key)
@@ -914,7 +917,6 @@ def process_segments(
                 page_array=page_array,
             )
 
-            hitl_triggered = None
             # if enable_hitl == 'true':
             # # if std_hitl: # HITL for standard output blueprint match is disabled until we have option to choose Blueprint in A2I
             #     for page_number in range(start_page, end_page + 1):
@@ -962,61 +964,65 @@ def handle_skip_bda(event, config):
         Dict containing the processed document ready for summarization/evaluation
     """
     logger.info("Handling skip_bda scenario - using existing document data")
-    
+
     # Load the document from the event
     working_bucket = os.environ.get("WORKING_BUCKET")
     document = Document.load_document(event.get("document"), working_bucket, logger)
-    
+
     # Update document status to POSTPROCESSING
     document.status = Status.POSTPROCESSING
     document.workflow_execution_arn = event.get("execution_arn")
-    
+
     # Update document in AppSync
     document_service = create_document_service()
-    
+
     # Fetch current HITL status from DynamoDB (may have been updated by reviewer)
     current_doc = document_service.get_document(document.input_key)
     if current_doc:
         document.hitl_status = current_doc.hitl_status
         logger.info(f"Current HITL status from DynamoDB: {document.hitl_status}")
-    
+
     logger.info(f"Updating document status to {document.status} for skip_bda scenario")
     document_service.update_document(document)
-    
+
     # Get confidence threshold from configuration for potential HITL checks
     confidence_threshold = config.assessment.default_confidence_threshold
     logger.info(f"Using confidence threshold: {confidence_threshold}")
-    
+
     # Check if HITL should be triggered based on existing confidence alerts
     hitl_triggered = False
-    if is_hitl_enabled():
+    if is_hitl_enabled(config):
         # Check each section for confidence alerts below threshold
         for section in document.sections:
             alerts = section.confidence_threshold_alerts or []
             if len(alerts) > 0:
-                logger.info(f"Section {section.section_id} has {len(alerts)} confidence alerts")
+                logger.info(
+                    f"Section {section.section_id} has {len(alerts)} confidence alerts"
+                )
                 hitl_triggered = True
                 break
-    
+
     logger.info(f"Skip BDA - hitl_triggered: {hitl_triggered}")
-    
+
     # Add metering information for skip scenario
     document.metering = document.metering or {}
     document.metering["BDAProject/bda/documents-skip"] = {"documents": 1}
-    
+
     # Prepare response using serialization method
     output_bucket = event.get("output_bucket") or os.environ.get("OUTPUT_BUCKET")
     if not working_bucket:
         logger.warning("WORKING_BUCKET not set, using output_bucket for compression")
         working_bucket = output_bucket
-    
+
     response = {
-        "document": document.serialize_document(working_bucket, "processresults_skip", logger),
+        "document": document.serialize_document(
+            working_bucket, "processresults_skip", logger
+        ),
         "hitl_triggered": hitl_triggered,
         "bda_response_count": 0,
-        "skip_bda": True
+        "skip_bda": True,
     }
-    
+
     logger.info(f"Skip BDA response: {json.dumps(response, default=str)}")
     return response
 
@@ -1036,11 +1042,60 @@ def handler(event, context):
     """
     logger.info(f"Processing event: {json.dumps(event)}")
 
-    config = get_config(as_model=True)
-    
+    # Extract use_case_context for use-case-scoped configuration (like pattern-2)
+    # Handle both single event (dict) and array of events (list)
+    if isinstance(event, list) and not event:
+        logger.error("Empty BDA response list")
+        raise ValueError("No BDA responses provided")
+    event_for_uc = event[0] if isinstance(event, list) else event
+    # Warn if multiple events have inconsistent use_case_context values
+    if isinstance(event, list) and len(event) > 1:
+        contexts = {
+            (
+                (e.get("use_case_context") or {}).get("business_unit_id"),
+                (e.get("use_case_context") or {}).get("use_case_id"),
+            )
+            for e in event
+            if isinstance(e, dict)
+        }
+        if len(contexts) > 1:
+            logger.warning(
+                "Multiple use_case_context values detected in event list: %s",
+                contexts,
+            )
+    uc = (
+        event_for_uc.get("use_case_context") if isinstance(event_for_uc, dict) else None
+    )
+    if not isinstance(uc, dict):
+        if uc is not None:
+            logger.warning(
+                "use_case_context is not a dict (got %s), falling back to empty dict",
+                type(uc).__name__,
+            )
+        uc = {}
+    # Normalize partial use_case_context: if only one of business_unit_id or
+    # use_case_id is present, fall back to global config to avoid ValueError
+    uc_bu = uc.get("business_unit_id") or None
+    uc_uc = uc.get("use_case_id") or None
+    if bool(uc_bu) != bool(uc_uc):
+        logger.warning(
+            "Partial use_case_context detected (business_unit_id=%s, use_case_id=%s); "
+            "normalizing to global config",
+            uc_bu,
+            uc_uc,
+        )
+        uc_bu = None
+        uc_uc = None
+    config = get_config(
+        as_model=True,
+        business_unit_id=uc_bu,
+        use_case_id=uc_uc,
+    )
+
     # Check if this is a skip_bda scenario (reprocessing with existing data)
-    if event.get("skip_bda"):
-        return handle_skip_bda(event, config)
+    skip_bda = event_for_uc.get("skip_bda") if isinstance(event_for_uc, dict) else False
+    if skip_bda:
+        return handle_skip_bda(event_for_uc, config)
 
     # Check if we have a single BDA response or an array of responses
     bda_responses = []
@@ -1056,23 +1111,29 @@ def handler(event, context):
 
     # Extract required information from the first response
     first_response = bda_responses[0]
-    
+
     # Handle skipped BDA case (HITL reprocessing)
     if first_response.get("metadata", {}).get("skipped"):
-        logger.info("BDA was skipped - document already has extraction data (HITL reprocessing)")
+        logger.info(
+            "BDA was skipped - document already has extraction data (HITL reprocessing)"
+        )
         working_bucket = first_response["metadata"]["working_bucket"]
-        document = Document.load_document(first_response.get("document", {}), working_bucket, logger)
-        
+        document = Document.load_document(
+            first_response.get("document", {}), working_bucket, logger
+        )
+
         # Check if HITL review is needed
-        hitl_triggered = is_hitl_enabled() and any(
+        hitl_triggered = is_hitl_enabled(config) and any(
             section.confidence_threshold_alerts for section in document.sections
         )
-        
+
         return {
-            "document": document.serialize_document(working_bucket, "processresults_skip", logger),
-            "hitl_triggered": hitl_triggered
+            "document": document.serialize_document(
+                working_bucket, "processresults_skip", logger
+            ),
+            "hitl_triggered": hitl_triggered,
         }
-    
+
     output_bucket = first_response.get("output_bucket")
 
     # Handle different response formats
@@ -1113,13 +1174,13 @@ def handler(event, context):
 
     # Update document status
     document_service = create_document_service()
-    
+
     # Fetch current HITL status from DynamoDB (may have been updated by reviewer during reprocess)
     current_doc = document_service.get_document(document.input_key)
     if current_doc and current_doc.hitl_status:
         document.hitl_status = current_doc.hitl_status
         logger.info(f"Current HITL status from DynamoDB: {document.hitl_status}")
-    
+
     logger.info(f"Updating document status to {document.status}")
     document_service.update_document(document)
 
@@ -1217,8 +1278,11 @@ def handler(event, context):
         # Use the confidence threshold already calculated above
         metdatafile_path = "/".join(bda_result_prefix.split("/")[:-1])
         job_metadata_key = f"{metdatafile_path}/job_metadata.json"
-        execution_id = event.get("execution_arn", "").split(":")[-1]
-        logger.info(f"HITL processing - bda_result_bucket: {bda_result_bucket}, job_metadata_key: {job_metadata_key}")
+        exec_source = event_for_uc if isinstance(event_for_uc, dict) else first_response
+        execution_id = (exec_source.get("execution_arn") or "").split(":")[-1]
+        logger.info(
+            f"HITL processing - bda_result_bucket: {bda_result_bucket}, job_metadata_key: {job_metadata_key}"
+        )
         logger.info(f"HITL execution ID: {execution_id}")
 
         try:
@@ -1229,7 +1293,9 @@ def handler(event, context):
             logger.info(f"job_metadata keys: {list(job_metadata.keys())}")
             if "output_metadata" in job_metadata:
                 output_metadata = job_metadata["output_metadata"]
-                logger.info(f"output_metadata type: {type(output_metadata)}, content preview: {str(output_metadata)[:500]}")
+                logger.info(
+                    f"output_metadata type: {type(output_metadata)}, content preview: {str(output_metadata)[:500]}"
+                )
                 if isinstance(output_metadata, list):
                     for asset in output_metadata:
                         document, hitl_result = process_segments(
@@ -1240,8 +1306,11 @@ def handler(event, context):
                             confidence_threshold,
                             execution_id,
                             document,
+                            config,
                         )
-                        logger.info(f"process_segments returned hitl_result: {hitl_result}")
+                        logger.info(
+                            f"process_segments returned hitl_result: {hitl_result}"
+                        )
                         if hitl_result or hitl_triggered:
                             hitl_triggered = True
                 elif isinstance(output_metadata, dict):
@@ -1254,8 +1323,11 @@ def handler(event, context):
                             confidence_threshold,
                             execution_id,
                             document,
+                            config,
                         )
-                        logger.info(f"process_segments returned hitl_result: {hitl_result}")
+                        logger.info(
+                            f"process_segments returned hitl_result: {hitl_result}"
+                        )
                         if hitl_result or hitl_triggered:
                             hitl_triggered = True
                 else:
@@ -1287,14 +1359,25 @@ def handler(event, context):
     # Only set to PendingReview if not already reviewed (preserve completed/skipped status on reprocess)
     if hitl_triggered and document.sections:
         existing_status = document.hitl_status
-        if existing_status not in ("Review Completed", "Review Skipped", "Completed", "Skipped"):
-            hitl_sections_pending = [section.section_id for section in document.sections]
+        if existing_status not in (
+            "Review Completed",
+            "Review Skipped",
+            "Completed",
+            "Skipped",
+        ):
+            hitl_sections_pending = [
+                section.section_id for section in document.sections
+            ]
             document.hitl_status = "PendingReview"
             document.hitl_sections_pending = hitl_sections_pending
             document.hitl_sections_completed = []
-            logger.info(f"Document requires human review. Sections pending: {hitl_sections_pending}")
+            logger.info(
+                f"Document requires human review. Sections pending: {hitl_sections_pending}"
+            )
         else:
-            logger.info(f"Document already reviewed (status: {existing_status}), preserving HITL status on reprocess")
+            logger.info(
+                f"Document already reviewed (status: {existing_status}), preserving HITL status on reprocess"
+            )
 
     # Update document (includes Review Status)
     document_service.update_document(document)

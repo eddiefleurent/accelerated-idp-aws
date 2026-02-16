@@ -101,11 +101,6 @@ def handler(event, context):
     start_time = time.time()  # Capture start time for Lambda metering
     logger.info(f"Starting assessment processing for event: {json.dumps(event, default=str)}")
 
-    # Load configuration
-    config = get_config(as_model=True)
-    # Use default=str to handle Decimal and other non-serializable types
-    logger.info(f"Config: {json.dumps(config.model_dump(), default=str)}")
-    
     # Extract input from event - handle both compressed and uncompressed
     document_data = event.get('document', {})
     section_id = event.get('section_id')
@@ -122,9 +117,41 @@ def handler(event, context):
     document = Document.load_document(document_data, working_bucket, logger)
     logger.info(f"Processing assessment for document {document.id}, section {section_id}")
 
-    # X-Ray annotations
-    xray_recorder.put_annotation('document_id', {document.id})
+    # Load configuration - fall back to document fields when use_case_context is missing
+    # Guard against use_case_context being null/None or a non-dict in the event
+    use_case_context = event.get("use_case_context")
+    if not isinstance(use_case_context, dict):
+        if use_case_context is not None:
+            logger.warning(
+                "use_case_context is not a dict (got %s), falling back to empty dict",
+                type(use_case_context).__name__,
+            )
+        use_case_context = {}
+    effective_business_unit_id = use_case_context.get("business_unit_id")
+    if effective_business_unit_id is None:
+        effective_business_unit_id = document.business_unit_id
+    effective_use_case_id = use_case_context.get("use_case_id")
+    if effective_use_case_id is None:
+        effective_use_case_id = document.use_case_id
+    config = get_config(
+        as_model=True,
+        business_unit_id=effective_business_unit_id,
+        use_case_id=effective_use_case_id,
+    )
+    logger.info(
+        "Config loaded for business_unit_id=%s, use_case_id=%s, assessment_granular_enabled=%s",
+        effective_business_unit_id,
+        effective_use_case_id,
+        config.assessment.granular.enabled,
+    )
+
+    # X-Ray annotations - use the effective IDs that match config resolution
+    xray_recorder.put_annotation('document_id', document.id)
     xray_recorder.put_annotation('processing_stage', 'assessment')
+    if effective_business_unit_id:
+        xray_recorder.put_annotation('business_unit_id', effective_business_unit_id)
+    if effective_use_case_id:
+        xray_recorder.put_annotation('use_case_id', effective_use_case_id)
 
     # Find the section we're processing
     section = None

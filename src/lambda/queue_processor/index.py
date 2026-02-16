@@ -95,8 +95,16 @@ def start_workflow(document: Document) -> Dict[str, Any]:
         compressed_document = document.to_dict()
         logger.warning("No WORKING_BUCKET configured, sending uncompressed document to workflow")
     
+    # Build use-case context for downstream Lambda handlers
+    use_case_context = {}
+    if document.business_unit_id:
+        use_case_context["business_unit_id"] = document.business_unit_id
+    if document.use_case_id:
+        use_case_context["use_case_id"] = document.use_case_id
+
     event = {
-        "document": compressed_document
+        "document": compressed_document,
+        "use_case_context": use_case_context,
     }
 
     logger.info(f"Starting workflow for document (size: {len(json.dumps(event, default=str))} chars)")

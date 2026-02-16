@@ -158,6 +158,14 @@ def handler(event, context):
     actual_document = None
     start_time = time.time()
     working_bucket = os.environ.get('WORKING_BUCKET')
+    use_case_context = event.get("use_case_context")
+    if not isinstance(use_case_context, dict):
+        if use_case_context is not None:
+            logger.warning(
+                "use_case_context is not a dict (got %s), falling back to empty dict",
+                type(use_case_context).__name__,
+            )
+        use_case_context = {}
     
     try:
         logger.info(f"Starting evaluation process: {json.dumps(event)}")
@@ -165,13 +173,42 @@ def handler(event, context):
         # Extract document from event
         actual_document = extract_document_from_event(event)
         
+        # Resolve effective BU/UC: prefer event context, fall back to document fields
+        resolved_bu = use_case_context.get("business_unit_id") or actual_document.business_unit_id
+        resolved_uc = use_case_context.get("use_case_id") or actual_document.use_case_id
+        # Guard against partial use-case identifiers
+        if (resolved_bu is None) != (resolved_uc is None):
+            logger.warning(
+                "Partial use_case_context detected (business_unit_id=%s, use_case_id=%s); "
+                "normalizing to global config",
+                resolved_bu,
+                resolved_uc,
+            )
+            resolved_bu = None
+            resolved_uc = None
+
+        # Build context conditionally so downstream sees {} when BU/UC are unresolved,
+        # rather than a truthy dict with None values.
+        use_case_context = {}
+        if resolved_bu is not None:
+            use_case_context["business_unit_id"] = resolved_bu
+        if resolved_uc is not None:
+            use_case_context["use_case_id"] = resolved_uc
+        
         # Load configuration and check if evaluation is enabled
-        config = get_config(as_model=True)
+        config = get_config(
+            as_model=True,
+            business_unit_id=resolved_bu,
+            use_case_id=resolved_uc,
+        )
         
         if not config.evaluation.enabled:
             logger.info("Evaluation is disabled in configuration, skipping evaluation")
             # Return document unchanged
-            return {'document': actual_document.serialize_document(working_bucket, 'evaluation')}
+            return {
+                'document': actual_document.serialize_document(working_bucket, 'evaluation'),
+                'use_case_context': use_case_context,
+            }
         
         # Set document status to EVALUATING before processing
         actual_document.status = Status.EVALUATING
@@ -188,7 +225,10 @@ def handler(event, context):
             # Update status in AppSync but keep using actual_document (don't overwrite)
             update_document_evaluation_status(actual_document, EvaluationStatus.NO_BASELINE)
             logger.info("Evaluation skipped - no baseline data available")
-            return {'document': actual_document.serialize_document(working_bucket, 'evaluation')}
+            return {
+                'document': actual_document.serialize_document(working_bucket, 'evaluation'),
+                'use_case_context': use_case_context,
+            }
         
         # Create evaluation service
         evaluation_service = evaluation.EvaluationService(config=config)
@@ -207,7 +247,10 @@ def handler(event, context):
             logger.error(error_msg)
             # Update status in AppSync but keep using evaluated_document (don't overwrite)
             update_document_evaluation_status(evaluated_document, EvaluationStatus.FAILED)
-            return {'document': evaluated_document.serialize_document(working_bucket, 'evaluation')}
+            return {
+                'document': evaluated_document.serialize_document(working_bucket, 'evaluation'),
+                'use_case_context': use_case_context,
+            }
        
         # Save evaluation results to reporting bucket for analytics using the SaveReportingData Lambda
         try:
@@ -239,7 +282,10 @@ def handler(event, context):
         logger.info(f"Evaluation process completed successfully in {time.time() - start_time:.2f} seconds")
         
         # Return document in state machine format
-        return {'document': evaluated_document.serialize_document(working_bucket, 'evaluation')}
+        return {
+            'document': evaluated_document.serialize_document(working_bucket, 'evaluation'),
+            'use_case_context': use_case_context,
+        }
     
     except Exception as e:
         error_msg = f"Error in handler: {str(e)}"
@@ -250,7 +296,10 @@ def handler(event, context):
             try:
                 # Update status in AppSync but keep using actual_document (don't overwrite)
                 update_document_evaluation_status(actual_document, EvaluationStatus.FAILED)
-                return {'document': actual_document.serialize_document(working_bucket, 'evaluation')}
+                return {
+                    'document': actual_document.serialize_document(working_bucket, 'evaluation'),
+                    'use_case_context': use_case_context,
+                }
             except Exception as update_error:
                 logger.error(f"Failed to update evaluation status: {str(update_error)}")
         

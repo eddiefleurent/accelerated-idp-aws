@@ -89,8 +89,20 @@ def handler(event, context):
         # orchestrator must ALWAYS run to make final compliance decision
         logger.info(f"Orchestrator will run for {len(document.sections)} section(s)")
         
-        # Get configuration
-        config = get_config()
+        # Get configuration - fall back to document fields when use_case_context is missing
+        use_case_context = event.get("use_case_context")
+        if not isinstance(use_case_context, dict):
+            if use_case_context is not None:
+                logger.warning(
+                    "use_case_context is not a dict (got %s), falling back to empty dict",
+                    type(use_case_context).__name__,
+                )
+            use_case_context = {}
+        config = get_config(
+            as_model=True,
+            business_unit_id=use_case_context.get("business_unit_id") or document.business_unit_id,
+            use_case_id=use_case_context.get("use_case_id") or document.use_case_id,
+        )
         
         # Create rule validation orchestrator service
         summarization_service = rule_validation.RuleValidationOrchestratorService(

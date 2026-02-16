@@ -138,11 +138,17 @@ Parameters:
     Type: String
     Description: "Pattern-3 source zipfile object name"
 
+  UseCaseConfigs:
+    Type: String
+    Default: ""
+    Description: "JSON array of use case configurations for multi-use-case document handling"
+
 Conditions:
   HasGuardrailConfig: !And [!Not [!Equals [!Ref BedrockGuardrailId, ""]], !Not [!Equals [!Ref BedrockGuardrailVersion, ""]]]
   HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, ""]]
   HasAppSyncApi: !Not [!Equals [!Ref AppSyncApiArn, ""]]
   IsECRImageScanningEnabled: !Equals [!Ref EnableECRImageScanning, "true"]
+  HasUseCaseConfigs: !Not [!Equals [!Ref UseCaseConfigs, ""]]
 
 Resources:
 
@@ -1473,6 +1479,10 @@ Resources:
       Default: !Ref ConfigurationDefaultS3Uri
       DefaultPricing: !Sub "s3://${ConfigurationBucket}/config_library/pricing.yaml"
       ConfigLibraryHash: !Ref ConfigLibraryHash
+      UseCaseConfigs: !If
+        - HasUseCaseConfigs
+        - !Ref UseCaseConfigs
+        - !Ref AWS::NoValue
 
   
   OCRFunction:

@@ -31,14 +31,37 @@ def handler(event, context):
     start_time = time.time()  # Capture start time for Lambda metering
     logger.info(f"Event: {json.dumps(event)}")
 
-    # Load configuration
-    config = get_config(as_model=True)
-    logger.info(f"Config: {json.dumps(config.model_dump(), default=str)}")
-    
     # For Map state, we get just one section from the document
     # Extract the document and section from the event - handle both compressed and uncompressed
     working_bucket = os.environ.get('WORKING_BUCKET')
     full_document = Document.load_document(event.get("document", {}), working_bucket, logger)
+
+    # Load configuration - fall back to document fields when use_case_context is missing
+    # Guard against use_case_context being null/None in the event
+    use_case_context = event.get("use_case_context")
+    if not isinstance(use_case_context, dict):
+        if use_case_context is not None:
+            logger.warning(
+                "use_case_context is not a dict (got %s), falling back to empty dict",
+                type(use_case_context).__name__,
+            )
+        use_case_context = {}
+    effective_business_unit_id = use_case_context.get("business_unit_id")
+    if effective_business_unit_id is None:
+        effective_business_unit_id = full_document.business_unit_id
+    effective_use_case_id = use_case_context.get("use_case_id")
+    if effective_use_case_id is None:
+        effective_use_case_id = full_document.use_case_id
+    config = get_config(
+        as_model=True,
+        business_unit_id=effective_business_unit_id,
+        use_case_id=effective_use_case_id,
+    )
+    logger.info(
+        "Config loaded for business_unit_id=%s use_case_id=%s",
+        effective_business_unit_id,
+        effective_use_case_id,
+    )
     
     # Log loaded document for troubleshooting
     logger.info(f"Loaded document - ID: {full_document.id}, input_key: {full_document.input_key}")
@@ -48,9 +71,13 @@ def handler(event, context):
     logger.info(f"Full document content: {json.dumps(full_document.to_dict(), default=str)}")
 
     # X-Ray annotations
-    xray_recorder.put_annotation('document_id', {full_document.id})
+    xray_recorder.put_annotation('document_id', full_document.id)
     xray_recorder.put_annotation('processing_stage', 'extraction')
-    
+    if effective_business_unit_id:
+        xray_recorder.put_annotation('business_unit_id', effective_business_unit_id)
+    if effective_use_case_id:
+        xray_recorder.put_annotation('use_case_id', effective_use_case_id)
+
     # Get the section ID directly from the Map state input
     # Now using the simplified array of section IDs format
     section_id = event.get("section_id")
