@@ -31,6 +31,7 @@ class BatchProcessor:
         stack_name: str,
         config_path: Optional[str] = None,
         region: Optional[str] = None,
+        s3_prefix: Optional[str] = None,
     ):
         """
         Initialize batch processor
@@ -39,10 +40,12 @@ class BatchProcessor:
             stack_name: Name of the CloudFormation stack
             config_path: Optional path to configuration YAML
             region: AWS region (optional)
+            s3_prefix: Optional S3 key prefix for use-case routing (e.g., "bu/uc")
         """
         self.stack_name = stack_name
         self.config_path = config_path
         self.region = region
+        self.s3_prefix = s3_prefix.strip("/") if s3_prefix else None
 
         # Initialize AWS clients
         self.s3 = boto3.client("s3", region_name=region)
@@ -57,6 +60,34 @@ class BatchProcessor:
 
         self.resources = stack_info.get_resources()
         logger.info(f"Initialized batch processor for stack: {stack_name}")
+
+    def _apply_s3_prefix(self, s3_key: str) -> str:
+        """
+        Apply S3 prefix to a key if configured and not already present.
+
+        Args:
+            s3_key: The S3 key to which the prefix should be applied
+
+        Returns:
+            The S3 key with prefix prepended, or unchanged if no prefix configured
+        """
+        if self.s3_prefix and not s3_key.startswith(f"{self.s3_prefix}/"):
+            return f"{self.s3_prefix}/{s3_key}"
+        return s3_key
+
+    def _strip_s3_prefix(self, s3_key: str) -> str:
+        """
+        Strip S3 prefix from a key if configured and present.
+
+        Args:
+            s3_key: The S3 key from which the prefix should be stripped
+
+        Returns:
+            The S3 key with prefix removed, or unchanged if no prefix configured
+        """
+        if self.s3_prefix and s3_key.startswith(f"{self.s3_prefix}/"):
+            return s3_key[len(self.s3_prefix) + 1 :]
+        return s3_key
 
     def process_batch(
         self,
@@ -420,6 +451,9 @@ class BatchProcessor:
         elif doc["type"] == "s3-key":
             # Document already in InputBucket
             s3_key = doc["path"]
+            # Prepend S3 prefix for use-case routing if configured
+            # (consistent with local file uploads and S3 copies)
+            s3_key = self._apply_s3_prefix(s3_key)
             self._validate_s3_key(s3_key)
             logger.info(f"Referenced existing {doc['filename']} at {s3_key}")
             return s3_key
@@ -451,6 +485,9 @@ class BatchProcessor:
         else:
             # Standardized: batch_id/filename
             s3_key = f"{batch_id}/{filename}"
+
+        # Prepend S3 prefix for use-case routing if configured
+        s3_key = self._apply_s3_prefix(s3_key)
 
         # Upload file
         input_bucket = self.resources["InputBucket"]
@@ -497,6 +534,9 @@ class BatchProcessor:
         # Construct destination key: batch_id/filename
         dest_key = f"{batch_id}/{filename}"
 
+        # Prepend S3 prefix for use-case routing if configured
+        dest_key = self._apply_s3_prefix(dest_key)
+
         # Copy object
         input_bucket = self.resources["InputBucket"]
         copy_source = {"Bucket": source_bucket, "Key": source_key}
@@ -527,6 +567,9 @@ class BatchProcessor:
         else:
             # Manifest-based: use filename
             dest_doc_key = f"{batch_id}/{doc['filename']}"
+
+        # Prepend S3 prefix for use-case routing if configured (mirrors _upload_local_file_with_path)
+        dest_doc_key = self._apply_s3_prefix(dest_doc_key)
 
         baseline_bucket = self.resources.get("EvaluationBaselineBucket")
         if not baseline_bucket:
@@ -748,7 +791,10 @@ class BatchProcessor:
         os.makedirs(output_dir, exist_ok=True)
 
         # First pass: count files to download
-        batch_prefix = f"{batch_id}/"
+        # Prepend s3_prefix when use-case routing is configured
+        batch_prefix = (
+            f"{self.s3_prefix}/{batch_id}/" if self.s3_prefix else f"{batch_id}/"
+        )
         paginator = self.s3.get_paginator("list_objects_v2")
         pages = paginator.paginate(Bucket=output_bucket, Prefix=batch_prefix)
 
@@ -784,8 +830,10 @@ class BatchProcessor:
             task = progress.add_task("Downloading results...", total=total_files)
 
             for s3_key in files_to_download:
-                # Construct local file path
-                local_path = os.path.join(output_dir, s3_key)
+                # Normalize local path: strip s3_prefix so output directory
+                # layout is consistent with the pre-prefix structure
+                normalized_key = self._strip_s3_prefix(s3_key)
+                local_path = os.path.join(output_dir, normalized_key)
 
                 # Create directory if needed
                 local_dir = os.path.dirname(local_path)
@@ -798,8 +846,12 @@ class BatchProcessor:
 
                 files_downloaded += 1
 
-                # Track document
-                doc_key = s3_key.split("/")[1] if "/" in s3_key else s3_key
+                # Track document - use already-computed normalized_key
+                doc_key = (
+                    normalized_key.split("/")[1]
+                    if "/" in normalized_key
+                    else normalized_key
+                )
                 documents_downloaded.add(doc_key)
 
                 # Update progress

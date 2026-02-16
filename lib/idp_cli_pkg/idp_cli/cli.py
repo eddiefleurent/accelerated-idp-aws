@@ -35,6 +35,75 @@ logger = logging.getLogger(__name__)
 console = Console()
 
 
+def _validate_use_case_identifiers(
+    business_unit_id: Optional[str], use_case_id: Optional[str]
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Validate that use-case identifiers are properly paired and well-formed.
+
+    Checks:
+    - Both must be provided together (or neither).
+    - Neither may be empty or whitespace-only.
+    - Neither may contain the '#' character.
+    - Neither may contain the '/' character.
+    - Neither may use reserved DEFAULT identifiers.
+
+    Returns:
+        Tuple of (stripped_business_unit_id, stripped_use_case_id) when both are
+        provided, or (None, None) when neither is provided.
+
+    Exits with code 1 and prints an error message on validation failure.
+    """
+    # Normalize: strip whitespace so padded IDs don't slip through
+    bu_stripped = business_unit_id.strip() if business_unit_id else ""
+    uc_stripped = use_case_id.strip() if use_case_id else ""
+
+    # Fast-fail: reject empty/whitespace when flag is explicitly provided
+    if business_unit_id is not None and not bu_stripped:
+        console.print(
+            "[red]✗ Error: --business-unit-id cannot be empty or whitespace[/red]"
+        )
+        sys.exit(1)
+    if use_case_id is not None and not uc_stripped:
+        console.print("[red]✗ Error: --use-case-id cannot be empty or whitespace[/red]")
+        sys.exit(1)
+
+    # Treat None or whitespace-only as "not provided" for the both-or-neither check
+    bu_provided = bool(business_unit_id and bu_stripped)
+    uc_provided = bool(use_case_id and uc_stripped)
+
+    if bu_provided != uc_provided:
+        console.print(
+            "[red]✗ Error: --business-unit-id and --use-case-id must be provided together[/red]"
+        )
+        sys.exit(1)
+
+    if bu_provided and uc_provided:
+        for label, value in [
+            ("--business-unit-id", bu_stripped),
+            ("--use-case-id", uc_stripped),
+        ]:
+            if "#" in value:
+                console.print(
+                    f"[red]✗ Error: {label} cannot contain the '#' character (got: {value!r})[/red]"
+                )
+                sys.exit(1)
+            normalized = value.lstrip("_").upper()
+            if normalized == "DEFAULT" or normalized.startswith("DEFAULT_"):
+                console.print(
+                    f"[red]✗ Error: {label} cannot use reserved DEFAULT identifiers (got: {value!r})[/red]"
+                )
+                sys.exit(1)
+            if "/" in value:
+                console.print(
+                    f"[red]✗ Error: {label} cannot contain '/' (got: {value!r})[/red]"
+                )
+                sys.exit(1)
+        return bu_stripped, uc_stripped
+
+    return None, None
+
+
 def _build_from_local_code(from_code_dir: str, region: str, stack_name: str) -> tuple:
     """
     Build project from local code using publish.py
@@ -205,6 +274,13 @@ def cli():
 )
 @click.option("--region", help="AWS region (optional)")
 @click.option("--role-arn", help="CloudFormation service role ARN")
+@click.option(
+    "--business-unit-id",
+    help="Business unit identifier (for multi-tenant use-case routing)",
+)
+@click.option(
+    "--use-case-id", help="Use case identifier (for multi-tenant use-case routing)"
+)
 def deploy(
     stack_name: str,
     pattern: str,
@@ -221,6 +297,8 @@ def deploy(
     no_rollback: bool,
     region: Optional[str],
     role_arn: Optional[str],
+    business_unit_id: Optional[str] = None,
+    use_case_id: Optional[str] = None,
 ):
     """
     Deploy or update IDP stack from command line
@@ -257,6 +335,11 @@ def deploy(
                 "[red]✗ Error: Cannot specify both --from-code and --template-url[/red]"
             )
             sys.exit(1)
+
+        # Validate use-case identifiers (paired + format) and normalize
+        business_unit_id, use_case_id = _validate_use_case_identifiers(
+            business_unit_id, use_case_id
+        )
 
         # Auto-detect region if not provided
         if not region:
@@ -406,6 +489,8 @@ def deploy(
             additional_params=additional_params,
             region=region,
             stack_name=stack_name,
+            business_unit_id=business_unit_id,
+            use_case_id=use_case_id,
         )
 
         # Debug: Show CustomConfigPath if present
@@ -1308,6 +1393,14 @@ def rerun_inference(
     type=int,
     help="Limit number of files to process (for testing purposes)",
 )
+@click.option(
+    "--business-unit-id",
+    help="Business unit identifier (prefixes S3 upload key for use-case routing)",
+)
+@click.option(
+    "--use-case-id",
+    help="Use case identifier (prefixes S3 upload key for use-case routing)",
+)
 def run_inference(
     stack_name: str,
     manifest: Optional[str],
@@ -1324,6 +1417,8 @@ def run_inference(
     refresh_interval: int,
     region: Optional[str],
     number_of_files: Optional[int],
+    business_unit_id: Optional[str] = None,
+    use_case_id: Optional[str] = None,
 ):
     """
     Run inference on a batch of documents
@@ -1415,12 +1510,34 @@ def run_inference(
                     sys.exit(1)
             console.print("[green]✓ Manifest validated successfully[/green]")
 
+        # Validate use-case identifiers (paired + format) and normalize
+        business_unit_id, use_case_id = _validate_use_case_identifiers(
+            business_unit_id, use_case_id
+        )
+
+        if test_set and business_unit_id:
+            console.print(
+                "[red]✗ Error: --business-unit-id/--use-case-id are not supported with --test-set[/red]"
+            )
+            sys.exit(1)
+
+        # Build S3 prefix for use-case routing
+        s3_prefix = None
+        if business_unit_id and use_case_id:
+            s3_prefix = f"{business_unit_id}/{use_case_id}"
+            console.print(
+                f"[bold blue]Using S3 prefix for use-case routing: {s3_prefix}/[/bold blue]"
+            )
+
         # Initialize processor
         console.print(
             f"[bold blue]Initializing batch processor for stack: {stack_name}[/bold blue]"
         )
         processor = BatchProcessor(
-            stack_name=stack_name, config_path=config, region=region
+            stack_name=stack_name,
+            config_path=config,
+            region=region,
+            s3_prefix=s3_prefix,
         )
 
         # Process batch based on source type
