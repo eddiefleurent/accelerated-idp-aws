@@ -1131,11 +1131,14 @@ Resources:
           CONFIGURATION_TABLE_NAME: !Ref ConfigurationTableName
           TRACKING_TABLE_NAME: !Ref TrackingTableName
           USER_POOL_ID: !Ref UserPoolId
+          CONFIGURATION_BUCKET: !Ref ConfigurationBucketName
       LoggingConfig:
         LogGroup: !Ref UseCaseResolverFunctionLogGroup
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref ConfigurationTableName
+        - S3ReadPolicy:
+            BucketName: !Ref ConfigurationBucketName
         - Statement:
             - Effect: Allow
               Action:

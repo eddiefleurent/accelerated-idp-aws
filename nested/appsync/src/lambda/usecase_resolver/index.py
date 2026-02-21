@@ -13,9 +13,12 @@ import logging
 import os
 
 import boto3
+import yaml
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 from idp_common.config.configuration_manager import ConfigurationManager
+from idp_common.config.constants import CONFIG_TYPE_DEFAULT
+from idp_common.config.merge_utils import merge_config_with_defaults
 from idp_common.utils.auth import get_caller_groups
 from pydantic import ValidationError
 
@@ -24,7 +27,9 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 dynamodb = boto3.resource("dynamodb")
 cognito_client = boto3.client("cognito-idp")
+s3_client = boto3.client("s3")
 tracking_table_name = os.environ.get("TRACKING_TABLE_NAME", "")
+configuration_bucket = os.environ.get("CONFIGURATION_BUCKET", "")
 user_pool_id = os.environ.get("USER_POOL_ID", "")
 if not tracking_table_name:
     raise RuntimeError(
@@ -146,8 +151,106 @@ def _check_use_case_access(event, business_unit_id, use_case_id):
 
 
 _SAFE_ARG_KEYS = frozenset(
-    {"businessUnitId", "useCaseId", "name", "description", "limit", "nextToken", "customConfig"}
+    {"businessUnitId", "useCaseId", "name", "description", "limit", "nextToken", "customConfig", "sourceConfig"}
 )
+
+
+def _resolve_source_config(source_config, manager):
+    """Resolve a source config specification into a config dict.
+
+    Supports:
+    - ``None`` / empty: copies the current global merged config
+    - ``"library:<pattern>/<preset>"``: loads a preset from the config
+      library on S3 (e.g. ``library:pattern-2/bank-statement-sample``)
+    - JSON string: parses inline JSON as the config
+
+    Returns a dict suitable for ``save_use_case_configuration``, or
+    ``None`` if resolution fails gracefully.
+    """
+    if not source_config or not source_config.strip():
+        # Default: seed from global merged config so the new use case
+        # starts with an independent copy of the current baseline.
+        merged = manager.get_merged_configuration()
+        if merged is None:
+            logger.warning("No global merged config available to seed UC Default")
+            return None
+        return merged.model_dump(mode="python")
+
+    source_config = source_config.strip()
+
+    if source_config.startswith("library:"):
+        return _load_config_from_library(source_config[len("library:"):])
+
+    # Inline JSON
+    try:
+        parsed = json.loads(source_config)
+        if not isinstance(parsed, dict):
+            raise ValueError("sourceConfig JSON must be an object")
+        return parsed
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid sourceConfig JSON: {e}") from e
+
+
+def _load_config_from_library(library_path):
+    """Load a config preset from the S3 config library.
+
+    ``library_path`` is ``<pattern>/<preset-name>``, e.g.
+    ``pattern-2/bank-statement-sample``.
+    """
+    if not configuration_bucket:
+        raise ValueError(
+            "CONFIGURATION_BUCKET not set; cannot load config library presets"
+        )
+
+    parts = library_path.strip("/").split("/", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValueError(
+            f"Invalid library path '{library_path}'. "
+            "Expected format: <pattern>/<preset-name>"
+        )
+    pattern, preset = parts
+
+    for ext in ("yaml", "json"):
+        s3_key = f"config_library/{pattern}/{preset}/config.{ext}"
+        try:
+            resp = s3_client.get_object(
+                Bucket=configuration_bucket, Key=s3_key
+            )
+            content = resp["Body"].read().decode("utf-8")
+            if ext == "json":
+                config = json.loads(content)
+            else:
+                config = yaml.safe_load(content)
+
+            if not isinstance(config, dict):
+                raise ValueError(
+                    f"Config at {s3_key} is not a dict"
+                )
+
+            logger.info(
+                "Loaded config library preset %s/%s from s3://%s/%s",
+                pattern, preset, configuration_bucket, s3_key,
+            )
+
+            # Merge with system defaults so the UC config is complete
+            try:
+                config = merge_config_with_defaults(config, pattern=pattern)
+            except Exception as e:
+                logger.warning(
+                    "Could not merge library config with system defaults: %s", e
+                )
+
+            return config
+        except s3_client.exceptions.NoSuchKey:
+            continue
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchKey":
+                continue
+            raise
+
+    raise ValueError(
+        f"Config preset '{preset}' not found for {pattern} in config library"
+    )
 
 
 def handler(event, context):
@@ -187,15 +290,31 @@ def handler(event, context):
             for key in ("businessUnitId", "useCaseId", "name"):
                 if key not in args:
                     raise ValueError(f"Missing required argument: {key}")
-            manager.register_use_case(
-                args["businessUnitId"],
-                args["useCaseId"],
-                args["name"],
-                args.get("description", ""),
+
+            bu_id = args["businessUnitId"]
+            uc_id = args["useCaseId"]
+
+            uc_config = _resolve_source_config(
+                args.get("sourceConfig"), manager
             )
+
+            manager.register_use_case(
+                bu_id, uc_id, args["name"], args.get("description", ""),
+            )
+
+            if uc_config:
+                manager.save_use_case_configuration(
+                    bu_id, uc_id, CONFIG_TYPE_DEFAULT, uc_config,
+                )
+                logger.info(
+                    "Seeded UC Default config for %s/%s (%d classes)",
+                    bu_id, uc_id,
+                    len(uc_config.get("classes", [])),
+                )
+
             return {
-                "businessUnitId": args["businessUnitId"],
-                "useCaseId": args["useCaseId"],
+                "businessUnitId": bu_id,
+                "useCaseId": uc_id,
                 "name": args["name"],
                 "description": args.get("description", ""),
             }

@@ -54,11 +54,15 @@ const useUseCases = ({ isAdmin = true, authLoading = false } = {}) => {
     }
   }, []);
 
-  const createUseCase = useCallback(async (businessUnitId, useCaseId, name, description = '') => {
+  const createUseCase = useCallback(async (businessUnitId, useCaseId, name, description = '', sourceConfig = null) => {
     try {
+      const variables = { businessUnitId, useCaseId, name, description };
+      if (sourceConfig) {
+        variables.sourceConfig = sourceConfig;
+      }
       const result = await client.graphql({
         query: createUseCaseMutation,
-        variables: { businessUnitId, useCaseId, name, description },
+        variables,
       });
       if (result.errors && result.errors.length > 0) {
         throw new Error(result.errors[0].message || 'GraphQL Error');

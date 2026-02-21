@@ -582,7 +582,7 @@ type Mutation {
   createUser(email: String!, persona: String!, allowedUseCases: [String]): User @aws_cognito_user_pools
   deleteUser(userId: ID!): Boolean @aws_cognito_user_pools
   # Use-Case Management
-  createUseCase(businessUnitId: String!, useCaseId: String!, name: String!, description: String): UseCase @aws_cognito_user_pools
+  createUseCase(businessUnitId: String!, useCaseId: String!, name: String!, description: String, sourceConfig: String): UseCase @aws_cognito_user_pools
   updateUseCaseConfiguration(businessUnitId: String!, useCaseId: String!, customConfig: AWSJSON!): UpdateConfigurationResponse @aws_cognito_user_pools
   # HITL Section Review
   completeSectionReview(objectKey: String!, sectionId: String!, editedData: AWSJSON): Document @aws_cognito_user_pools
