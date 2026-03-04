@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import re
-import time
 import uuid
 from datetime import datetime, timezone
 
@@ -43,37 +42,6 @@ def _to_dynamo_attr(value):
     if value is None:
         return {"NULL": True}
     return {"S": str(value)}
-
-
-def delete_email_lock_with_retry(
-    table, email, max_retries=4, base_backoff_seconds=0.25
-):
-    """Delete EMAIL_LOCK item with bounded retries and exponential backoff."""
-    lock_key = {"PK": f"EMAIL_LOCK#{email}", "SK": f"EMAIL_LOCK#{email}"}
-    last_error = None
-
-    for attempt in range(max_retries):
-        try:
-            table.delete_item(Key=lock_key)
-            return
-        except Exception as err:
-            last_error = err
-            if attempt == max_retries - 1:
-                break
-            delay = base_backoff_seconds * (2**attempt)
-            logger.warning(
-                "Failed to delete EMAIL_LOCK for %s (attempt %d/%d), retrying in %.2fs: %s",
-                email,
-                attempt + 1,
-                max_retries,
-                delay,
-                err,
-            )
-            time.sleep(delay)
-
-    raise RuntimeError(
-        f"Failed to delete EMAIL_LOCK for {email} after {max_retries} attempts"
-    ) from last_error
 
 
 def delete_user_and_email_lock_atomically(user_id, email):
@@ -136,7 +104,9 @@ def normalize_use_case_list(use_cases):
     Preserves order of first occurrence. Raises ValueError when the list
     contains empty-after-strip entries.
     """
-    normalized = [uc.strip() for uc in use_cases if isinstance(uc, str)]
+    if any(not isinstance(uc, str) for uc in use_cases):
+        raise TypeError("allowedUseCases must be list of strings")
+    normalized = [uc.strip() for uc in use_cases]
     if any(not uc for uc in normalized):
         raise ValueError("allowedUseCases cannot contain empty strings")
     return list(dict.fromkeys(normalized))
@@ -310,21 +280,28 @@ def create_user(args):
         created_cognito_user = bool(
             created_cognito_user or getattr(e, "created_cognito_user", False)
         )
+        rollback_success = True
         logger.error(f"Failed to sync user to Cognito: {e}")
         try:
             delete_user_and_email_lock_atomically(user_id, email)
         except Exception as rollback_error:
+            rollback_success = False
             logger.error(
                 f"Failed to rollback DynamoDB record for user {user_id}: {rollback_error}"
             )
-        # Clean up Cognito only if this request successfully created it.
-        if created_cognito_user:
+        # Clean up Cognito only if this request successfully created it and rollback succeeded.
+        if created_cognito_user and rollback_success:
             try:
                 cognito.admin_delete_user(UserPoolId=USER_POOL_ID, Username=email)
             except Exception as cognito_cleanup_error:
                 logger.error(
                     f"Failed to clean up Cognito user {email}: {cognito_cleanup_error}"
                 )
+        elif created_cognito_user and not rollback_success:
+            logger.error(
+                "Skipping Cognito cleanup for %s because DynamoDB rollback failed",
+                email,
+            )
         raise e
 
     logger.info(f"User {email} created successfully")
@@ -355,9 +332,8 @@ def delete_user(args):
     user_record = response["Item"]
     email = user_record["email"]
 
-    # Delete EMAIL_LOCK first, then user record, to avoid orphaned locks.
-    delete_email_lock_with_retry(table, email)
-    table.delete_item(Key={"PK": f"USER#{user_id}", "SK": f"USER#{user_id}"})
+    # Delete USER and EMAIL_LOCK atomically.
+    delete_user_and_email_lock_atomically(user_id, email)
 
     # Sync to Cognito
     try:
