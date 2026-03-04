@@ -248,11 +248,11 @@ export const useSchemaDesigner = (initialSchema = [], isRuleSchema = false) => {
   const prevInitialSchemaRef = useRef(null);
 
   // Reset initialized when initialSchema changes externally (e.g. use-case switch).
-  // Compare by serialized class IDs to distinguish external changes from internal
-  // edits that feed back through the onChange -> extractionSchema cycle.
+  // Use a stable serialization of the full schema content so field/rule changes
+  // are detected even when $id / x-aws-idp-document-type stay the same.
   useEffect(() => {
     if (!initialSchema) return;
-    const schemaKey = Array.isArray(initialSchema) ? initialSchema.map((c) => c.$id || c['x-aws-idp-document-type'] || '').join(',') : '';
+    const schemaKey = Array.isArray(initialSchema) ? JSON.stringify(initialSchema) : '';
     if (prevInitialSchemaRef.current !== null && prevInitialSchemaRef.current !== schemaKey) {
       setInitialized(false);
       setIsDirty(false);
