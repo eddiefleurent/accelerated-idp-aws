@@ -45,7 +45,9 @@ def _to_dynamo_attr(value):
     return {"S": str(value)}
 
 
-def delete_email_lock_with_retry(table, email, max_retries=4, base_backoff_seconds=0.25):
+def delete_email_lock_with_retry(
+    table, email, max_retries=4, base_backoff_seconds=0.25
+):
     """Delete EMAIL_LOCK item with bounded retries and exponential backoff."""
     lock_key = {"PK": f"EMAIL_LOCK#{email}", "SK": f"EMAIL_LOCK#{email}"}
     last_error = None
@@ -118,7 +120,9 @@ def create_user(args):
     # Validate email domain if restrictions are configured
     if ALLOWED_SIGNUP_EMAIL_DOMAINS and ALLOWED_SIGNUP_EMAIL_DOMAINS.strip():
         allowed_domains = [
-            d.strip().lower() for d in ALLOWED_SIGNUP_EMAIL_DOMAINS.split(",") if d.strip()
+            d.strip().lower()
+            for d in ALLOWED_SIGNUP_EMAIL_DOMAINS.split(",")
+            if d.strip()
         ]
         if allowed_domains:  # Only validate if there are actual domains configured
             if "@" not in email:
@@ -132,7 +136,9 @@ def create_user(args):
 
     # Validate persona
     if persona not in ["Admin", "Supervisor", "Reviewer"]:
-        raise ValueError(f"Invalid persona: {persona}. Must be 'Admin', 'Supervisor', or 'Reviewer'")
+        raise ValueError(
+            f"Invalid persona: {persona}. Must be 'Admin', 'Supervisor', or 'Reviewer'"
+        )
 
     # Normalize allowed_use_cases: admins always get wildcard; validate type for others
     if persona == "Admin":
@@ -185,7 +191,10 @@ def create_user(args):
     # deterministic email-lock item. Two concurrent requests for the same
     # email will race on the lock item's ConditionExpression, so at most
     # one succeeds -- even though the user PK is unique per request.
-    email_lock_key = {"PK": {"S": f"EMAIL_LOCK#{email}"}, "SK": {"S": f"EMAIL_LOCK#{email}"}}
+    email_lock_key = {
+        "PK": {"S": f"EMAIL_LOCK#{email}"},
+        "SK": {"S": f"EMAIL_LOCK#{email}"},
+    }
     try:
         dynamodb.meta.client.transact_write_items(
             TransactItems=[
@@ -209,8 +218,33 @@ def create_user(args):
                 },
             ]
         )
-    except dynamodb.meta.client.exceptions.TransactionCanceledException:
-        raise ValueError(f"User with email {email} already exists")
+    except dynamodb.meta.client.exceptions.TransactionCanceledException as e:
+        response = getattr(e, "response", {}) or {}
+        cancellation_reasons = response.get("CancellationReasons") or []
+        reason_codes = [
+            reason.get("Code")
+            for reason in cancellation_reasons
+            if isinstance(reason, dict) and reason.get("Code")
+        ]
+        error_code = response.get("Error", {}).get("Code", "")
+        error_message = response.get("Error", {}).get("Message", "")
+
+        logger.error(
+            "Transaction canceled while creating user %s: error_code=%s reason_codes=%s details=%s",
+            email,
+            error_code,
+            reason_codes,
+            response,
+            exc_info=True,
+        )
+
+        has_conditional_failure = "ConditionalCheckFailed" in reason_codes or (
+            "ConditionalCheckFailed" in error_message
+        )
+        if has_conditional_failure:
+            raise ValueError(f"User with email {email} already exists") from e
+
+        raise
 
     # Sync to Cognito
     created_cognito_user = False
@@ -313,7 +347,9 @@ def list_users():
         # Parse allowedUseCases from JSON string stored in DynamoDB
         allowed_raw = item.get("allowedUseCases", "[]")
         try:
-            allowed_list = json.loads(allowed_raw) if isinstance(allowed_raw, str) else allowed_raw
+            allowed_list = (
+                json.loads(allowed_raw) if isinstance(allowed_raw, str) else allowed_raw
+            )
         except (json.JSONDecodeError, TypeError):
             allowed_list = []
         if isinstance(allowed_list, list):
@@ -406,7 +442,9 @@ def sync_cognito_users_to_dynamodb():
                 dt = user["UserCreateDate"]
                 created_at = dt.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
             else:
-                created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                created_at = (
+                    datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                )
 
             # Admins always get wildcard access regardless of what is stored
             # in the Cognito custom:allowed_use_cases attribute (which may be
@@ -418,7 +456,11 @@ def sync_cognito_users_to_dynamodb():
                 # parse the raw JSON, strip whitespace, remove duplicates, and
                 # reject wildcard access for non-Admin personas.
                 try:
-                    uc_list = json.loads(allowed_use_cases_raw) if isinstance(allowed_use_cases_raw, str) else allowed_use_cases_raw
+                    uc_list = (
+                        json.loads(allowed_use_cases_raw)
+                        if isinstance(allowed_use_cases_raw, str)
+                        else allowed_use_cases_raw
+                    )
                 except (json.JSONDecodeError, TypeError):
                     uc_list = []
                 if not isinstance(uc_list, list):
@@ -446,7 +488,9 @@ def sync_cognito_users_to_dynamodb():
                 "status": "active",
                 "allowedUseCases": allowed_use_cases_raw,
                 "createdAt": created_at,
-                "updatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "updatedAt": datetime.now(timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
             }
 
             table.put_item(Item=user_record)
@@ -472,9 +516,7 @@ def sync_user_to_cognito(user_id, email, persona, operation, allowed_use_cases=N
             uc_value = json.dumps(allowed_use_cases)
         else:
             uc_value = json.dumps([])
-        user_attributes.append(
-            {"Name": "custom:allowed_use_cases", "Value": uc_value}
-        )
+        user_attributes.append({"Name": "custom:allowed_use_cases", "Value": uc_value})
 
         try:
             # Create user in Cognito
@@ -497,7 +539,9 @@ def sync_user_to_cognito(user_id, email, persona, operation, allowed_use_cases=N
                 UserPoolId=USER_POOL_ID, Username=email, GroupName=group_name
             )
 
-            logger.info(f"User {email} synced to Cognito and added to group {group_name}")
+            logger.info(
+                f"User {email} synced to Cognito and added to group {group_name}"
+            )
             return created_cognito_user
         except Exception as e:
             setattr(e, "created_cognito_user", created_cognito_user)
