@@ -396,14 +396,17 @@ def handler(event: Dict[str, Any], context: Any) -> None:
                         uc_name = uc_entry.get("name", f"{bu_id}/{uc_id}")
                         uc_desc = uc_entry.get("description", "")
 
-                        uc_config = resolve_content(uc_entry.get("config", {}))
-                        if not isinstance(uc_config, dict):
+                        uc_config_delta = resolve_content(uc_entry.get("config", {}))
+                        if not isinstance(uc_config_delta, dict):
                             raise ValueError(
                                 f"UseCaseConfigs entry config for {bu_id}/{uc_id} must resolve to a dict"
                             )
-                        uc_config = merge_custom_with_defaults(uc_config)
+                        # Validate against merged view (delta + defaults) but
+                        # persist only the sparse delta to preserve inheritance.
+                        merged_view = merge_custom_with_defaults(uc_config_delta)
                         if region_type in ["us", "eu"]:
-                            uc_config = swap_model_ids(uc_config, region_type)
+                            swap_model_ids(merged_view, region_type)  # validate only
+                            uc_config_delta = swap_model_ids(uc_config_delta, region_type)
 
                         resolved_entries.append(
                             {
@@ -411,7 +414,7 @@ def handler(event: Dict[str, Any], context: Any) -> None:
                                 "uc_id": uc_id,
                                 "uc_name": uc_name,
                                 "uc_desc": uc_desc,
-                                "uc_config": uc_config,
+                                "uc_config": uc_config_delta,
                             }
                         )
                     except Exception as e:

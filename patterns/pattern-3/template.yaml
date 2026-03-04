@@ -142,6 +142,8 @@ Parameters:
     Type: String
     Default: ""
     Description: "JSON array of use case configurations for multi-use-case document handling"
+    AllowedPattern: '^$|^\s*\[[\s\S]*\]\s*$'
+    ConstraintDescription: "Must be empty or a JSON array."
 
 Conditions:
   HasGuardrailConfig: !And [!Not [!Equals [!Ref BedrockGuardrailId, ""]], !Not [!Equals [!Ref BedrockGuardrailVersion, ""]]]
