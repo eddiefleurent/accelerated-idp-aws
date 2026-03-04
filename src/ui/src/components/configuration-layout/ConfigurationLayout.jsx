@@ -76,6 +76,10 @@ const ConfigurationLayout = () => {
         }
       : {};
 
+  // Stable key that changes when the use-case scope changes, used to force
+  // SchemaBuilder remount so useSchemaDesigner gets a fresh initial state.
+  const configScopeKey = effectiveUseCase ? `${effectiveUseCase.businessUnitId}/${effectiveUseCase.useCaseId}` : 'global';
+
   const {
     schema,
     mergedConfig,
@@ -182,14 +186,10 @@ const ConfigurationLayout = () => {
       setFormValues(formData);
 
       // Initialize extraction schema from config (stored in classes field)
-      if (mergedConfig.classes) {
-        setExtractionSchema(mergedConfig.classes);
-      }
+      setExtractionSchema(mergedConfig.classes || null);
 
       // Initialize rule schema from config (stored in rule_classes field)
-      if (mergedConfig.rule_classes) {
-        setRuleSchema(mergedConfig.rule_classes);
-      }
+      setRuleSchema(mergedConfig.rule_classes || null);
 
       // Set both JSON and YAML content
       const jsonString = JSON.stringify(mergedConfig, null, 2);
@@ -202,6 +202,10 @@ const ConfigurationLayout = () => {
         console.error('Error converting to YAML:', e);
         setYamlContent('# Error converting to YAML');
       }
+    } else {
+      // Clear stale schema state when config is unloaded (e.g. use-case switch)
+      setExtractionSchema(null);
+      setRuleSchema(null);
     }
   }, [mergedConfig]);
 
@@ -1718,6 +1722,7 @@ const ConfigurationLayout = () => {
             {viewMode === 'form' && (
               <SpaceBetween size="l">
                 <ConfigBuilder
+                  key={configScopeKey}
                   schema={{
                     ...schema,
                     properties: Object.fromEntries(Object.entries(schema?.properties || {}).filter(([key]) => key !== 'classes')),
