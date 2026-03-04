@@ -1014,7 +1014,19 @@ class ConfigurationManager:
             # Moto's transact_write_items currently expects native python values;
             # production DynamoDB expects AttributeValue maps. Retry with native
             # values only for this compatibility case.
-            if "TypeError" in str(e):
+            error_response = getattr(e, "response", {}) or {}
+            cancellation_reasons = error_response.get("CancellationReasons") or []
+            reason_codes = [
+                reason.get("Code")
+                for reason in cancellation_reasons
+                if isinstance(reason, dict) and reason.get("Code")
+            ]
+            has_type_error_cause = isinstance(e.__cause__, TypeError) or isinstance(
+                e.__context__, TypeError
+            )
+            has_type_error_reason = "TypeError" in reason_codes
+
+            if has_type_error_cause or has_type_error_reason:
                 logger.warning(
                     "Retrying atomic use-case batch apply with native transaction item format"
                 )

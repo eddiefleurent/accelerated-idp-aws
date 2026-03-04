@@ -76,6 +76,34 @@ def delete_email_lock_with_retry(
     ) from last_error
 
 
+def delete_user_and_email_lock_atomically(user_id, email):
+    """Delete USER and EMAIL_LOCK records in one transaction."""
+    dynamodb.meta.client.transact_write_items(
+        TransactItems=[
+            {
+                "Delete": {
+                    "TableName": USERS_TABLE_NAME,
+                    "Key": {
+                        "PK": {"S": f"EMAIL_LOCK#{email}"},
+                        "SK": {"S": f"EMAIL_LOCK#{email}"},
+                    },
+                    "ConditionExpression": "attribute_exists(PK)",
+                }
+            },
+            {
+                "Delete": {
+                    "TableName": USERS_TABLE_NAME,
+                    "Key": {
+                        "PK": {"S": f"USER#{user_id}"},
+                        "SK": {"S": f"USER#{user_id}"},
+                    },
+                    "ConditionExpression": "attribute_exists(PK)",
+                }
+            },
+        ]
+    )
+
+
 def normalize_use_case_list(use_cases):
     """Normalize a list of use-case strings: strip whitespace, remove empties, deduplicate.
 
@@ -257,10 +285,8 @@ def create_user(args):
             created_cognito_user or getattr(e, "created_cognito_user", False)
         )
         logger.error(f"Failed to sync user to Cognito: {e}")
-        # Roll back lock first, then user item, to avoid orphaned locks.
-        delete_email_lock_with_retry(table, email)
         try:
-            table.delete_item(Key={"PK": f"USER#{user_id}", "SK": f"USER#{user_id}"})
+            delete_user_and_email_lock_atomically(user_id, email)
         except Exception as rollback_error:
             logger.error(
                 f"Failed to rollback DynamoDB record for user {user_id}: {rollback_error}"
@@ -492,9 +518,51 @@ def sync_cognito_users_to_dynamodb():
                 .isoformat()
                 .replace("+00:00", "Z"),
             }
-
-            table.put_item(Item=user_record)
-            logger.info(f"Synced Cognito user {email} to DynamoDB")
+            try:
+                dynamodb.meta.client.transact_write_items(
+                    TransactItems=[
+                        {
+                            "Put": {
+                                "TableName": USERS_TABLE_NAME,
+                                "Item": {
+                                    k: _to_dynamo_attr(v)
+                                    for k, v in user_record.items()
+                                },
+                                "ConditionExpression": "attribute_not_exists(PK)",
+                            }
+                        },
+                        {
+                            "Put": {
+                                "TableName": USERS_TABLE_NAME,
+                                "Item": {
+                                    "PK": {"S": f"EMAIL_LOCK#{email}"},
+                                    "SK": {"S": f"EMAIL_LOCK#{email}"},
+                                    "email": {"S": email},
+                                    "userId": {"S": user_id},
+                                },
+                                "ConditionExpression": "attribute_not_exists(PK)",
+                            }
+                        },
+                    ]
+                )
+                logger.info(f"Synced Cognito user {email} to DynamoDB")
+                existing_emails.add(email)
+            except dynamodb.meta.client.exceptions.TransactionCanceledException as e:
+                response = getattr(e, "response", {}) or {}
+                cancellation_reasons = response.get("CancellationReasons") or []
+                reason_codes = [
+                    reason.get("Code")
+                    for reason in cancellation_reasons
+                    if isinstance(reason, dict) and reason.get("Code")
+                ]
+                if "ConditionalCheckFailed" in reason_codes:
+                    logger.info(
+                        "Skipping Cognito user sync for %s because USER/EMAIL_LOCK already exists",
+                        email,
+                    )
+                    existing_emails.add(email)
+                    continue
+                raise
 
 
 def sync_user_to_cognito(user_id, email, persona, operation, allowed_use_cases=None):

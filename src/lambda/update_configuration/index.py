@@ -428,7 +428,7 @@ def handler(event: Dict[str, Any], context: Any) -> None:
                             uc_config_delta = swap_model_ids(
                                 uc_config_delta, region_type
                             )
-                        IDPConfig.parse_obj(merged_view)
+                        IDPConfig.model_validate(merged_view)
 
                         resolved_entries.append(
                             {
