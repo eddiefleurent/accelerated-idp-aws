@@ -127,11 +127,20 @@ def handler(event, context):
                 type(use_case_context).__name__,
             )
         use_case_context = {}
-    effective_business_unit_id = use_case_context.get("business_unit_id")
-    if effective_business_unit_id is None:
+    # Require both keys to be present; partial context would mix sources
+    ctx_bu = use_case_context.get("business_unit_id")
+    ctx_uc = use_case_context.get("use_case_id")
+    if ctx_bu and ctx_uc:
+        effective_business_unit_id = ctx_bu
+        effective_use_case_id = ctx_uc
+    else:
+        if ctx_bu or ctx_uc:
+            logger.warning(
+                "Partial use_case_context (bu=%s, uc=%s); falling back to document fields",
+                ctx_bu,
+                ctx_uc,
+            )
         effective_business_unit_id = document.business_unit_id
-    effective_use_case_id = use_case_context.get("use_case_id")
-    if effective_use_case_id is None:
         effective_use_case_id = document.use_case_id
     config = get_config(
         as_model=True,
