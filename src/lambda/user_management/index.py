@@ -80,7 +80,6 @@ def delete_user_and_email_lock_atomically(user_id, email):
                         "PK": {"S": f"EMAIL_LOCK#{email}"},
                         "SK": {"S": f"EMAIL_LOCK#{email}"},
                     },
-                    "ConditionExpression": "attribute_exists(PK)",
                 }
             },
             {
@@ -144,6 +143,8 @@ def normalize_use_case_list(use_cases):
     Preserves order of first occurrence. Raises ValueError when the list
     contains empty-after-strip entries.
     """
+    if not isinstance(use_cases, (list, tuple)):
+        raise TypeError("allowedUseCases must be list of strings")
     if any(not isinstance(uc, str) for uc in use_cases):
         raise TypeError("allowedUseCases must be list of strings")
     normalized = [uc.strip() for uc in use_cases]
