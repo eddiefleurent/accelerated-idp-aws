@@ -526,10 +526,8 @@ def sync_cognito_users_to_dynamodb():
                 # Non-admins must not have wildcard access
                 uc_list = [uc for uc in uc_list if uc != "*"]
                 if persona == "Supervisor" and not uc_list:
-                    logger.warning(
-                        "Supervisor %s has no allowed use cases; "
-                        "assign at least one use case to avoid a no-access account.",
-                        email,
+                    raise ValueError(
+                        "Supervisors must have explicit use-case assignments"
                     )
                 allowed_use_cases_raw = json.dumps(uc_list)
 
@@ -619,6 +617,7 @@ def sync_user_to_cognito(user_id, email, persona, operation, allowed_use_cases=N
             )
             return created_cognito_user
         except Exception as e:
+            # Attach create-state so caller can decide whether Cognito rollback is required.
             setattr(e, "created_cognito_user", created_cognito_user)
             raise
 
