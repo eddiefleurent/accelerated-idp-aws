@@ -870,7 +870,9 @@ class ConfigurationManager:
             f"Saved use-case configuration: {business_unit_id}/{use_case_id} ({config_type})"
         )
 
-    def apply_use_case_batch_atomic(self, resolved_entries: list[Dict[str, Any]]) -> None:
+    def apply_use_case_batch_atomic(
+        self, resolved_entries: list[Dict[str, Any]]
+    ) -> None:
         """
         Atomically save use-case Default configs and registry entries in one transaction.
 
@@ -978,7 +980,9 @@ class ConfigurationManager:
             if isinstance(value, list):
                 return {"L": [_serialize_attribute_value(v) for v in value]}
             if isinstance(value, dict):
-                return {"M": {k: _serialize_attribute_value(v) for k, v in value.items()}}
+                return {
+                    "M": {k: _serialize_attribute_value(v) for k, v in value.items()}
+                }
             return {"S": str(value)}
 
         transact_items_typed: list[Dict[str, Any]] = []
@@ -1003,7 +1007,9 @@ class ConfigurationManager:
             self.dynamodb.meta.client.transact_write_items(
                 TransactItems=transact_items_typed
             )
-            logger.info("Atomically applied %d use-case config entries", len(resolved_entries))
+            logger.info(
+                "Atomically applied %d use-case config entries", len(resolved_entries)
+            )
         except ClientError as e:
             # Moto's transact_write_items currently expects native python values;
             # production DynamoDB expects AttributeValue maps. Retry with native
@@ -1023,7 +1029,10 @@ class ConfigurationManager:
             logger.error("Atomic use-case batch apply failed: %s", e)
             raise
         except Exception:
-            logger.error("Atomic use-case batch apply failed with unexpected error", exc_info=True)
+            logger.error(
+                "Atomic use-case batch apply failed with unexpected error",
+                exc_info=True,
+            )
             raise
 
     @overload
@@ -1104,10 +1113,11 @@ class ConfigurationManager:
                 valid_entries.append(uc)
 
             if non_dict_dropped:
-                bad_types = {type(uc).__name__ for uc in use_cases if not isinstance(uc, dict)}
+                bad_types = {
+                    type(uc).__name__ for uc in use_cases if not isinstance(uc, dict)
+                }
                 logger.warning(
-                    "Dropped %d non-dict entries from use_cases registry "
-                    "(types: %s)",
+                    "Dropped %d non-dict entries from use_cases registry (types: %s)",
                     non_dict_dropped,
                     ", ".join(sorted(bad_types)),
                 )
@@ -1299,7 +1309,11 @@ class ConfigurationManager:
             )
 
         # Clean up associated configuration records (best-effort)
-        for config_type in (CONFIG_TYPE_DEFAULT, CONFIG_TYPE_CUSTOM, CONFIG_TYPE_SCHEMA):
+        for config_type in (
+            CONFIG_TYPE_DEFAULT,
+            CONFIG_TYPE_CUSTOM,
+            CONFIG_TYPE_SCHEMA,
+        ):
             try:
                 key = self._use_case_config_key(
                     business_unit_id, use_case_id, config_type
@@ -1390,17 +1404,20 @@ class ConfigurationManager:
         # Merge deltas
         apply_delta_with_deletions(existing_custom, config_dict)
 
-        # Validate: Global Default + UC Default + UC Custom must produce valid IDPConfig
+        # Validate: Global Default + Global Custom + UC Default + UC Custom must produce valid IDPConfig
         global_default = self.get_configuration(CONFIG_TYPE_DEFAULT)
         if global_default and isinstance(global_default, IDPConfig):
-            merged = global_default.model_dump(mode="python")
+            merged = deepcopy(global_default.model_dump(mode="python"))
+
+            global_custom_dict = self.get_raw_configuration(CONFIG_TYPE_CUSTOM)
+            if global_custom_dict:
+                deep_update(merged, global_custom_dict)
 
             uc_default_key = self._use_case_config_key(
                 business_unit_id, use_case_id, CONFIG_TYPE_DEFAULT
             )
             uc_default_dict = self.get_raw_configuration(uc_default_key)
             if uc_default_dict:
-                merged = deepcopy(merged)
                 deep_update(merged, uc_default_dict)
 
             validation_dict = deepcopy(merged)
