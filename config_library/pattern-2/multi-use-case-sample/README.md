@@ -101,7 +101,7 @@ Navigate to the Use Case Management page in the web UI to create and configure u
 
 Upload documents using the S3 key prefix convention:
 
-```
+```text
 s3://input-bucket/retail-banking/mortgage-processing/lending_package.pdf
 s3://input-bucket/insurance/claims-processing/lending_package.pdf
 s3://input-bucket/lending_package.pdf  # Uses global default config

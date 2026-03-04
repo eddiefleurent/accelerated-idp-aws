@@ -51,7 +51,7 @@ The multi-use-case feature allows a single GenAIIDP deployment to serve multiple
 
 Documents are routed to use cases based on their S3 key structure:
 
-```
+```text
 s3://input-bucket/{business_unit_id}/{use_case_id}/{filename}
 ```
 
@@ -62,7 +62,7 @@ When a document is uploaded with this key structure:
 3. **Each Lambda function** in the workflow receives the `use_case_context` and calls `get_config()` with the business unit and use case IDs
 4. **Configuration Manager** returns the merged use-case-scoped configuration
 
-```
+```text
 S3 Upload: retail-banking/mortgage/application.pdf
     │
     ▼
@@ -299,7 +299,7 @@ A sample configuration preset is provided at `config_library/pattern-2/multi-use
 These schemas match the sample PDFs at `samples/lending_package.pdf` (for the mortgage use case) and `samples/insurance_package_single.pdf` (for the insurance use case), enabling end-to-end testing out of the box.
 
 > **📝 Note:** The `multi-use-case-sample` preset is currently available for **Pattern 2 only**. For Pattern 1, use any standard preset (e.g., `lending-package-sample`) and register use cases post-deployment via the CLI or Web UI. Both patterns fully support use-case-scoped configuration at runtime.
-
+>
 > **📝 Note:** The `UseCaseConfigs` CloudFormation parameter has a 4096-byte limit. Since the full `use_cases.json` with complete JSON Schema definitions exceeds this limit, use the CLI script (`scripts/manage_use_cases.py`) to register use cases post-deployment, or reference per-use-case configs via S3 URIs in the `config` field.
 
 ## Roles & Permissions
