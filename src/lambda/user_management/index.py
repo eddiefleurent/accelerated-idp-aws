@@ -44,6 +44,31 @@ def _to_dynamo_attr(value):
     return {"S": str(value)}
 
 
+def build_user_email_lock_transact_items(user_record, email, user_id):
+    """Build a transactional write payload for USER and EMAIL_LOCK creation."""
+    return [
+        {
+            "Put": {
+                "TableName": USERS_TABLE_NAME,
+                "Item": {k: _to_dynamo_attr(v) for k, v in user_record.items()},
+                "ConditionExpression": "attribute_not_exists(PK)",
+            }
+        },
+        {
+            "Put": {
+                "TableName": USERS_TABLE_NAME,
+                "Item": {
+                    "PK": {"S": f"EMAIL_LOCK#{email}"},
+                    "SK": {"S": f"EMAIL_LOCK#{email}"},
+                    "email": {"S": email},
+                    "userId": {"S": user_id},
+                },
+                "ConditionExpression": "attribute_not_exists(PK)",
+            }
+        },
+    ]
+
+
 def delete_user_and_email_lock_atomically(user_id, email):
     """Delete USER and EMAIL_LOCK records in one transaction."""
     dynamodb.meta.client.transact_write_items(
@@ -215,32 +240,11 @@ def create_user(args):
     # deterministic email-lock item. Two concurrent requests for the same
     # email will race on the lock item's ConditionExpression, so at most
     # one succeeds -- even though the user PK is unique per request.
-    email_lock_key = {
-        "PK": {"S": f"EMAIL_LOCK#{email}"},
-        "SK": {"S": f"EMAIL_LOCK#{email}"},
-    }
     try:
         dynamodb.meta.client.transact_write_items(
-            TransactItems=[
-                {
-                    "Put": {
-                        "TableName": USERS_TABLE_NAME,
-                        "Item": {k: _to_dynamo_attr(v) for k, v in user_record.items()},
-                        "ConditionExpression": "attribute_not_exists(PK)",
-                    }
-                },
-                {
-                    "Put": {
-                        "TableName": USERS_TABLE_NAME,
-                        "Item": {
-                            **email_lock_key,
-                            "email": {"S": email},
-                            "userId": {"S": user_id},
-                        },
-                        "ConditionExpression": "attribute_not_exists(PK)",
-                    }
-                },
-            ]
+            TransactItems=build_user_email_lock_transact_items(
+                user_record, email, user_id
+            )
         )
     except dynamodb.meta.client.exceptions.TransactionCanceledException as e:
         response = getattr(e, "response", {}) or {}
@@ -518,30 +522,9 @@ def sync_cognito_users_to_dynamodb():
             }
             try:
                 dynamodb.meta.client.transact_write_items(
-                    TransactItems=[
-                        {
-                            "Put": {
-                                "TableName": USERS_TABLE_NAME,
-                                "Item": {
-                                    k: _to_dynamo_attr(v)
-                                    for k, v in user_record.items()
-                                },
-                                "ConditionExpression": "attribute_not_exists(PK)",
-                            }
-                        },
-                        {
-                            "Put": {
-                                "TableName": USERS_TABLE_NAME,
-                                "Item": {
-                                    "PK": {"S": f"EMAIL_LOCK#{email}"},
-                                    "SK": {"S": f"EMAIL_LOCK#{email}"},
-                                    "email": {"S": email},
-                                    "userId": {"S": user_id},
-                                },
-                                "ConditionExpression": "attribute_not_exists(PK)",
-                            }
-                        },
-                    ]
+                    TransactItems=build_user_email_lock_transact_items(
+                        user_record, email, user_id
+                    )
                 )
                 logger.info(f"Synced Cognito user {email} to DynamoDB")
                 existing_emails.add(email)
