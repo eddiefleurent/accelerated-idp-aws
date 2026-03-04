@@ -27,6 +27,23 @@ REVIEWER_GROUP = os.environ.get("REVIEWER_GROUP", "Reviewer")
 ALLOWED_SIGNUP_EMAIL_DOMAINS = os.environ.get("ALLOWED_SIGNUP_EMAIL_DOMAINS", "")
 
 
+def _to_dynamo_attr(value):
+    """Convert a Python value to a DynamoDB AttributeValue dict for low-level API calls."""
+    if isinstance(value, str):
+        return {"S": value}
+    if isinstance(value, bool):
+        return {"BOOL": value}
+    if isinstance(value, (int, float)):
+        return {"N": str(value)}
+    if isinstance(value, list):
+        return {"L": [_to_dynamo_attr(v) for v in value]}
+    if isinstance(value, dict):
+        return {"M": {k: _to_dynamo_attr(v) for k, v in value.items()}}
+    if value is None:
+        return {"NULL": True}
+    return {"S": str(value)}
+
+
 def normalize_use_case_list(use_cases):
     """Normalize a list of use-case strings: strip whitespace, remove empties, deduplicate.
 
@@ -134,17 +151,35 @@ def create_user(args):
         "updatedAt": now,
     }
 
-    # Use conditional expression to prevent race conditions: if two concurrent
-    # requests for the same email both pass the EmailIndex check above, only
-    # the first put_item succeeds. Without this, the second request could
-    # overwrite the DynamoDB record and then fail on Cognito, leaving an
-    # orphaned Cognito user after rollback deletes the first request's record.
+    # Use a transaction to atomically create both the user record and a
+    # deterministic email-lock item. Two concurrent requests for the same
+    # email will race on the lock item's ConditionExpression, so at most
+    # one succeeds -- even though the user PK is unique per request.
+    email_lock_key = {"PK": {"S": f"EMAIL_LOCK#{email}"}, "SK": {"S": f"EMAIL_LOCK#{email}"}}
     try:
-        table.put_item(
-            Item=user_record,
-            ConditionExpression="attribute_not_exists(PK)",
+        dynamodb.meta.client.transact_write_items(
+            TransactItems=[
+                {
+                    "Put": {
+                        "TableName": USERS_TABLE_NAME,
+                        "Item": {k: _to_dynamo_attr(v) for k, v in user_record.items()},
+                        "ConditionExpression": "attribute_not_exists(PK)",
+                    }
+                },
+                {
+                    "Put": {
+                        "TableName": USERS_TABLE_NAME,
+                        "Item": {
+                            **email_lock_key,
+                            "email": {"S": email},
+                            "userId": {"S": user_id},
+                        },
+                        "ConditionExpression": "attribute_not_exists(PK)",
+                    }
+                },
+            ]
         )
-    except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+    except dynamodb.meta.client.exceptions.TransactionCanceledException:
         raise ValueError(f"User with email {email} already exists")
 
     # Sync to Cognito
@@ -152,12 +187,18 @@ def create_user(args):
         sync_user_to_cognito(user_id, email, persona, "create", allowed_use_cases)
     except Exception as e:
         logger.error(f"Failed to sync user to Cognito: {e}")
-        # Rollback DynamoDB record
+        # Rollback both DynamoDB items
         try:
             table.delete_item(Key={"PK": f"USER#{user_id}", "SK": f"USER#{user_id}"})
         except Exception as rollback_error:
             logger.error(
                 f"Failed to rollback DynamoDB record for user {user_id}: {rollback_error}"
+            )
+        try:
+            table.delete_item(Key={"PK": f"EMAIL_LOCK#{email}", "SK": f"EMAIL_LOCK#{email}"})
+        except Exception as rollback_error:
+            logger.error(
+                f"Failed to rollback email lock for {email}: {rollback_error}"
             )
         # Attempt to clean up potentially orphaned Cognito user
         try:
@@ -196,8 +237,12 @@ def delete_user(args):
     user_record = response["Item"]
     email = user_record["email"]
 
-    # Delete from DynamoDB
+    # Delete user record and email lock from DynamoDB
     table.delete_item(Key={"PK": f"USER#{user_id}", "SK": f"USER#{user_id}"})
+    try:
+        table.delete_item(Key={"PK": f"EMAIL_LOCK#{email}", "SK": f"EMAIL_LOCK#{email}"})
+    except Exception as lock_err:
+        logger.warning(f"Failed to delete email lock for {email}: {lock_err}")
 
     # Sync to Cognito
     try:
