@@ -97,6 +97,21 @@ def delete_user_and_email_lock_atomically(user_id, email):
     )
 
 
+def paginated_scan(table, **scan_kwargs):
+    """Scan all pages and return a combined item list."""
+    items = []
+    response = table.scan(**scan_kwargs)
+    items.extend(response.get("Items", []))
+
+    while response.get("LastEvaluatedKey"):
+        response = table.scan(
+            **scan_kwargs, ExclusiveStartKey=response["LastEvaluatedKey"]
+        )
+        items.extend(response.get("Items", []))
+
+    return items
+
+
 def normalize_single_use_case(use_case):
     """Normalize one use-case string and validate non-empty content."""
     if not isinstance(use_case, str):
@@ -336,15 +351,23 @@ def delete_user(args):
     user_record = response["Item"]
     email = user_record["email"]
 
-    # Delete USER and EMAIL_LOCK atomically.
-    delete_user_and_email_lock_atomically(user_id, email)
-
-    # Sync to Cognito
+    # Delete from Cognito first; only remove DynamoDB records on success.
     try:
         sync_user_to_cognito(user_id, email, user_record["persona"], "delete")
     except Exception as e:
-        logger.warning(f"Failed to sync user deletion to Cognito: {e}")
-        # Continue with deletion as DynamoDB is the source of truth
+        logger.error(
+            "Failed to delete Cognito user for user_id=%s email=%s: %s",
+            user_id,
+            email,
+            e,
+            exc_info=True,
+        )
+        raise RuntimeError(
+            f"Failed to delete user {user_id}: Cognito deletion did not succeed"
+        ) from e
+
+    # Delete USER and EMAIL_LOCK atomically.
+    delete_user_and_email_lock_atomically(user_id, email)
 
     logger.info(f"User {user_id} deleted successfully")
     return True
@@ -369,13 +392,14 @@ def list_users():
     table = dynamodb.Table(USERS_TABLE_NAME)
 
     # Scan for all user records
-    response = table.scan(
+    items = paginated_scan(
+        table,
         FilterExpression="begins_with(PK, :pk_prefix)",
         ExpressionAttributeValues={":pk_prefix": "USER#"},
     )
 
     users = []
-    for item in response.get("Items", []):
+    for item in items:
         # Parse allowedUseCases from JSON string stored in DynamoDB
         allowed_raw = item.get("allowedUseCases", "[]")
         try:
@@ -420,12 +444,13 @@ def sync_cognito_users_to_dynamodb():
     table = dynamodb.Table(USERS_TABLE_NAME)
 
     # Get existing emails in DynamoDB for quick lookup
-    existing_response = table.scan(
+    existing_items = paginated_scan(
+        table,
         FilterExpression="begins_with(PK, :pk_prefix)",
         ExpressionAttributeValues={":pk_prefix": "USER#"},
         ProjectionExpression="email",
     )
-    existing_emails = {item["email"] for item in existing_response.get("Items", [])}
+    existing_emails = {item["email"] for item in existing_items}
 
     # List all Cognito users
     paginator = cognito.get_paginator("list_users")
