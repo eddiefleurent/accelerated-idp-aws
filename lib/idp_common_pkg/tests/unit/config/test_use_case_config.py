@@ -272,6 +272,64 @@ class TestUseCaseConfigurationCRUD:
             ConfigurationManager.validate_use_case_ids("bu", ["not-string"])
         assert "use_case_id must be a string" in str(excinfo.value)
 
+    def test_apply_use_case_batch_atomic_saves_configs_and_registry(self):
+        table = _create_config_table()
+        _seed_global_default(table)
+        mgr = ConfigurationManager(table_name="test-config-table")
+
+        entries = [
+            {
+                "bu_id": "retail",
+                "uc_id": "mortgage",
+                "uc_name": "Mortgage Processing",
+                "uc_desc": "Mortgage docs",
+                "uc_config": {"extraction": {"temperature": 0.2}},
+            },
+            {
+                "bu_id": "insurance",
+                "uc_id": "claims",
+                "uc_name": "Claims Processing",
+                "uc_desc": "Claims docs",
+                "uc_config": {"extraction": {"temperature": 0.4}},
+            },
+        ]
+
+        mgr.apply_use_case_batch_atomic(entries)
+
+        use_cases = sorted(
+            mgr.list_use_cases(),
+            key=lambda u: (u["businessUnitId"], u["useCaseId"]),
+        )
+        assert len(use_cases) == 2
+        assert use_cases[0]["businessUnitId"] == "insurance"
+        assert use_cases[1]["businessUnitId"] == "retail"
+
+        retail_config = mgr.get_raw_configuration("UC#retail#mortgage#Default")
+        insurance_config = mgr.get_raw_configuration("UC#insurance#claims#Default")
+        assert retail_config is not None
+        assert insurance_config is not None
+        assert retail_config["extraction"]["temperature"] == "0.2"
+        assert insurance_config["extraction"]["temperature"] == "0.4"
+
+    def test_apply_use_case_batch_atomic_rejects_large_batch(self):
+        _create_config_table()
+        mgr = ConfigurationManager(table_name="test-config-table")
+
+        entries = [
+            {
+                "bu_id": f"bu{i}",
+                "uc_id": f"uc{i}",
+                "uc_name": f"name{i}",
+                "uc_desc": "",
+                "uc_config": {},
+            }
+            for i in range(25)
+        ]
+
+        with pytest.raises(ValueError) as excinfo:
+            mgr.apply_use_case_batch_atomic(entries)
+        assert "at most 24 entries" in str(excinfo.value)
+
 
 # ===== Registry Tests =====
 

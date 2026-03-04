@@ -405,7 +405,7 @@ def handler(event: Dict[str, Any], context: Any) -> None:
                         # persist only the sparse delta to preserve inheritance.
                         merged_view = merge_custom_with_defaults(uc_config_delta)
                         if region_type in ["us", "eu"]:
-                            swap_model_ids(merged_view, region_type)  # validate only
+                            merged_view = swap_model_ids(merged_view, region_type)
                             uc_config_delta = swap_model_ids(uc_config_delta, region_type)
 
                         resolved_entries.append(
@@ -445,20 +445,9 @@ def handler(event: Dict[str, Any], context: Any) -> None:
                     logger.warning(error_summary)
                     raise ValueError(error_summary)
 
-                # --- Pass 2: Persist all validated entries ---
+                # --- Pass 2: Persist all validated entries atomically ---
+                manager.apply_use_case_batch_atomic(resolved_entries)
                 for entry in resolved_entries:
-                    manager.save_use_case_configuration(
-                        entry["bu_id"],
-                        entry["uc_id"],
-                        "Default",
-                        entry["uc_config"],
-                    )
-                    manager.register_use_case(
-                        entry["bu_id"],
-                        entry["uc_id"],
-                        entry["uc_name"],
-                        entry["uc_desc"],
-                    )
                     logger.info(
                         "Saved use-case configuration: %s/%s (%s)",
                         entry["bu_id"],

@@ -10,7 +10,11 @@ import logging
 from idp_common import metrics, get_config, extraction
 from idp_common.models import Document, Section, Status
 from idp_common.docs_service import create_document_service
-from idp_common.utils import calculate_lambda_metering, merge_metering_data
+from idp_common.utils import (
+    calculate_lambda_metering,
+    merge_metering_data,
+    resolve_use_case_context,
+)
 from aws_xray_sdk.core import xray_recorder, patch_all
 
 patch_all()
@@ -37,30 +41,9 @@ def handler(event, context):
     full_document = Document.load_document(event.get("document", {}), working_bucket, logger)
 
     # Load configuration - fall back to document fields when use_case_context is missing
-    # Guard against use_case_context being null/None in the event
-    use_case_context = event.get("use_case_context")
-    if not isinstance(use_case_context, dict):
-        if use_case_context is not None:
-            logger.warning(
-                "use_case_context is not a dict (got %s), falling back to empty dict",
-                type(use_case_context).__name__,
-            )
-        use_case_context = {}
-    # Require both keys to be present; partial context would mix sources
-    ctx_bu = use_case_context.get("business_unit_id")
-    ctx_uc = use_case_context.get("use_case_id")
-    if ctx_bu and ctx_uc:
-        effective_business_unit_id = ctx_bu
-        effective_use_case_id = ctx_uc
-    else:
-        if ctx_bu or ctx_uc:
-            logger.warning(
-                "Partial use_case_context (bu=%s, uc=%s); falling back to document fields",
-                ctx_bu,
-                ctx_uc,
-            )
-        effective_business_unit_id = full_document.business_unit_id
-        effective_use_case_id = full_document.use_case_id
+    effective_business_unit_id, effective_use_case_id = resolve_use_case_context(
+        event, full_document, logger
+    )
     config = get_config(
         as_model=True,
         business_unit_id=effective_business_unit_id,

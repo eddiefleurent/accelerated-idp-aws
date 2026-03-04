@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -42,6 +43,35 @@ def _to_dynamo_attr(value):
     if value is None:
         return {"NULL": True}
     return {"S": str(value)}
+
+
+def delete_email_lock_with_retry(table, email, max_retries=4, base_backoff_seconds=0.25):
+    """Delete EMAIL_LOCK item with bounded retries and exponential backoff."""
+    lock_key = {"PK": f"EMAIL_LOCK#{email}", "SK": f"EMAIL_LOCK#{email}"}
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            table.delete_item(Key=lock_key)
+            return
+        except Exception as err:
+            last_error = err
+            if attempt == max_retries - 1:
+                break
+            delay = base_backoff_seconds * (2**attempt)
+            logger.warning(
+                "Failed to delete EMAIL_LOCK for %s (attempt %d/%d), retrying in %.2fs: %s",
+                email,
+                attempt + 1,
+                max_retries,
+                delay,
+                err,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(
+        f"Failed to delete EMAIL_LOCK for {email} after {max_retries} attempts"
+    ) from last_error
 
 
 def normalize_use_case_list(use_cases):
@@ -183,30 +213,32 @@ def create_user(args):
         raise ValueError(f"User with email {email} already exists")
 
     # Sync to Cognito
+    created_cognito_user = False
     try:
-        sync_user_to_cognito(user_id, email, persona, "create", allowed_use_cases)
+        created_cognito_user = sync_user_to_cognito(
+            user_id, email, persona, "create", allowed_use_cases
+        )
     except Exception as e:
+        created_cognito_user = bool(
+            created_cognito_user or getattr(e, "created_cognito_user", False)
+        )
         logger.error(f"Failed to sync user to Cognito: {e}")
-        # Rollback both DynamoDB items
+        # Roll back lock first, then user item, to avoid orphaned locks.
+        delete_email_lock_with_retry(table, email)
         try:
             table.delete_item(Key={"PK": f"USER#{user_id}", "SK": f"USER#{user_id}"})
         except Exception as rollback_error:
             logger.error(
                 f"Failed to rollback DynamoDB record for user {user_id}: {rollback_error}"
             )
-        try:
-            table.delete_item(Key={"PK": f"EMAIL_LOCK#{email}", "SK": f"EMAIL_LOCK#{email}"})
-        except Exception as rollback_error:
-            logger.error(
-                f"Failed to rollback email lock for {email}: {rollback_error}"
-            )
-        # Attempt to clean up potentially orphaned Cognito user
-        try:
-            cognito.admin_delete_user(UserPoolId=USER_POOL_ID, Username=email)
-        except Exception as cognito_cleanup_error:
-            logger.error(
-                f"Failed to clean up Cognito user {email}: {cognito_cleanup_error}"
-            )
+        # Clean up Cognito only if this request successfully created it.
+        if created_cognito_user:
+            try:
+                cognito.admin_delete_user(UserPoolId=USER_POOL_ID, Username=email)
+            except Exception as cognito_cleanup_error:
+                logger.error(
+                    f"Failed to clean up Cognito user {email}: {cognito_cleanup_error}"
+                )
         raise e
 
     logger.info(f"User {email} created successfully")
@@ -237,12 +269,9 @@ def delete_user(args):
     user_record = response["Item"]
     email = user_record["email"]
 
-    # Delete user record and email lock from DynamoDB
+    # Delete EMAIL_LOCK first, then user record, to avoid orphaned locks.
+    delete_email_lock_with_retry(table, email)
     table.delete_item(Key={"PK": f"USER#{user_id}", "SK": f"USER#{user_id}"})
-    try:
-        table.delete_item(Key={"PK": f"EMAIL_LOCK#{email}", "SK": f"EMAIL_LOCK#{email}"})
-    except Exception as lock_err:
-        logger.warning(f"Failed to delete email lock for {email}: {lock_err}")
 
     # Sync to Cognito
     try:
@@ -427,6 +456,7 @@ def sync_cognito_users_to_dynamodb():
 def sync_user_to_cognito(user_id, email, persona, operation, allowed_use_cases=None):
     """Sync user operations to Cognito."""
     if operation == "create":
+        created_cognito_user = False
         # Build user attributes
         user_attributes = [
             {"Name": "email", "Value": email},
@@ -446,26 +476,32 @@ def sync_user_to_cognito(user_id, email, persona, operation, allowed_use_cases=N
             {"Name": "custom:allowed_use_cases", "Value": uc_value}
         )
 
-        # Create user in Cognito
-        cognito.admin_create_user(
-            UserPoolId=USER_POOL_ID,
-            Username=email,
-            UserAttributes=user_attributes,
-            DesiredDeliveryMediums=["EMAIL"],
-        )
+        try:
+            # Create user in Cognito
+            cognito.admin_create_user(
+                UserPoolId=USER_POOL_ID,
+                Username=email,
+                UserAttributes=user_attributes,
+                DesiredDeliveryMediums=["EMAIL"],
+            )
+            created_cognito_user = True
 
-        # Add to appropriate group
-        if persona == "Admin":
-            group_name = ADMIN_GROUP
-        elif persona == "Supervisor":
-            group_name = SUPERVISOR_GROUP
-        else:
-            group_name = REVIEWER_GROUP
-        cognito.admin_add_user_to_group(
-            UserPoolId=USER_POOL_ID, Username=email, GroupName=group_name
-        )
+            # Add to appropriate group
+            if persona == "Admin":
+                group_name = ADMIN_GROUP
+            elif persona == "Supervisor":
+                group_name = SUPERVISOR_GROUP
+            else:
+                group_name = REVIEWER_GROUP
+            cognito.admin_add_user_to_group(
+                UserPoolId=USER_POOL_ID, Username=email, GroupName=group_name
+            )
 
-        logger.info(f"User {email} synced to Cognito and added to group {group_name}")
+            logger.info(f"User {email} synced to Cognito and added to group {group_name}")
+            return created_cognito_user
+        except Exception as e:
+            setattr(e, "created_cognito_user", created_cognito_user)
+            raise
 
     elif operation == "delete":
         # Delete user from Cognito
@@ -474,3 +510,5 @@ def sync_user_to_cognito(user_id, email, persona, operation, allowed_use_cases=N
             logger.info(f"User {email} deleted from Cognito")
         except cognito.exceptions.UserNotFoundException:
             logger.warning(f"User {email} not found in Cognito during deletion")
+
+    return False

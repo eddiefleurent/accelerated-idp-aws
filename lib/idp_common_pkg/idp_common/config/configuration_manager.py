@@ -870,6 +870,162 @@ class ConfigurationManager:
             f"Saved use-case configuration: {business_unit_id}/{use_case_id} ({config_type})"
         )
 
+    def apply_use_case_batch_atomic(self, resolved_entries: list[Dict[str, Any]]) -> None:
+        """
+        Atomically save use-case Default configs and registry entries in one transaction.
+
+        Args:
+            resolved_entries: List of entries with:
+                - bu_id
+                - uc_id
+                - uc_name
+                - uc_desc
+                - uc_config
+
+        Raises:
+            ValueError: If entry structure is invalid or batch exceeds transaction limit.
+            ClientError: If DynamoDB transaction fails.
+        """
+        if not resolved_entries:
+            return
+
+        # One registry write + one config write per entry must fit in a single tx.
+        max_entries_per_tx = 24
+        if len(resolved_entries) > max_entries_per_tx:
+            raise ValueError(
+                f"UseCaseConfigs supports at most {max_entries_per_tx} entries per batch "
+                f"(received {len(resolved_entries)}) for atomic apply"
+            )
+
+        use_cases, version = self.list_use_cases(include_version=True)
+        registry_map: dict[tuple[str, str], Dict[str, Any]] = {
+            (uc.get("businessUnitId"), uc.get("useCaseId")): uc for uc in use_cases
+        }
+
+        transact_items_plain: list[Dict[str, Any]] = []
+
+        for entry in resolved_entries:
+            bu_id = entry.get("bu_id")
+            uc_id = entry.get("uc_id")
+            uc_name = entry.get("uc_name")
+            uc_desc = entry.get("uc_desc", "")
+            uc_config = entry.get("uc_config")
+
+            self.validate_use_case_ids(bu_id, uc_id)
+            if not isinstance(uc_name, str) or not uc_name.strip():
+                raise ValueError(
+                    f"use-case name for {bu_id}/{uc_id} must be a non-empty string"
+                )
+            if not isinstance(uc_desc, str):
+                raise ValueError(
+                    f"use-case description for {bu_id}/{uc_id} must be a string"
+                )
+            if not isinstance(uc_config, dict):
+                raise ValueError(
+                    f"use-case config for {bu_id}/{uc_id} must be a dictionary"
+                )
+
+            uc_key = self._use_case_config_key(bu_id, uc_id, CONFIG_TYPE_DEFAULT)
+            item = {"Configuration": uc_key}
+            item.update(ConfigurationRecord._stringify_values(uc_config))
+            transact_items_plain.append(
+                {
+                    "Put": {
+                        "TableName": self.table_name,
+                        "Item": item,
+                    }
+                }
+            )
+
+            registry_map[(bu_id, uc_id)] = {
+                "businessUnitId": bu_id,
+                "useCaseId": uc_id,
+                "name": uc_name,
+                "description": uc_desc,
+            }
+
+        updated_registry = list(registry_map.values())
+        new_version = version + 1
+
+        registry_item = {
+            "Configuration": USE_CASE_REGISTRY_KEY,
+            "use_cases": json.dumps(updated_registry),
+            "version": new_version,
+        }
+        registry_put: Dict[str, Any] = {
+            "TableName": self.table_name,
+            "Item": registry_item,
+            "ConditionExpression": (
+                "attribute_not_exists(version) OR version = :v"
+                if version == 0
+                else "version = :v"
+            ),
+            "ExpressionAttributeValues": {
+                ":v": version,
+            },
+        }
+        transact_items_plain.append({"Put": registry_put})
+
+        def _serialize_attribute_value(value: Any) -> Dict[str, Any]:
+            if value is None:
+                return {"NULL": True}
+            if isinstance(value, bool):
+                return {"BOOL": value}
+            if isinstance(value, (int, float)):
+                return {"N": str(value)}
+            if isinstance(value, str):
+                return {"S": value}
+            if isinstance(value, list):
+                return {"L": [_serialize_attribute_value(v) for v in value]}
+            if isinstance(value, dict):
+                return {"M": {k: _serialize_attribute_value(v) for k, v in value.items()}}
+            return {"S": str(value)}
+
+        transact_items_typed: list[Dict[str, Any]] = []
+        for tx_item in transact_items_plain:
+            put = tx_item["Put"]
+            typed_put: Dict[str, Any] = {
+                "TableName": put["TableName"],
+                "Item": {
+                    k: _serialize_attribute_value(v) for k, v in put["Item"].items()
+                },
+            }
+            if "ConditionExpression" in put:
+                typed_put["ConditionExpression"] = put["ConditionExpression"]
+            if "ExpressionAttributeValues" in put:
+                typed_put["ExpressionAttributeValues"] = {
+                    k: _serialize_attribute_value(v)
+                    for k, v in put["ExpressionAttributeValues"].items()
+                }
+            transact_items_typed.append({"Put": typed_put})
+
+        try:
+            self.dynamodb.meta.client.transact_write_items(
+                TransactItems=transact_items_typed
+            )
+            logger.info("Atomically applied %d use-case config entries", len(resolved_entries))
+        except ClientError as e:
+            # Moto's transact_write_items currently expects native python values;
+            # production DynamoDB expects AttributeValue maps. Retry with native
+            # values only for this compatibility case.
+            if "TypeError" in str(e):
+                logger.warning(
+                    "Retrying atomic use-case batch apply with native transaction item format"
+                )
+                self.dynamodb.meta.client.transact_write_items(
+                    TransactItems=transact_items_plain
+                )
+                logger.info(
+                    "Atomically applied %d use-case config entries",
+                    len(resolved_entries),
+                )
+                return
+            logger.error("Atomic use-case batch apply failed: %s", e)
+            raise
+        except Exception:
+            logger.error("Atomic use-case batch apply failed with unexpected error", exc_info=True)
+            raise
+
     @overload
     def list_use_cases(
         self, *, include_version: Literal[False] = False
