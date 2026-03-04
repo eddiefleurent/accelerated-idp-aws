@@ -104,6 +104,32 @@ def delete_user_and_email_lock_atomically(user_id, email):
     )
 
 
+def normalize_single_use_case(use_case):
+    """Normalize one use-case string and validate non-empty content."""
+    if not isinstance(use_case, str):
+        raise ValueError("allowedUseCases entries must be strings")
+    use_case = use_case.strip()
+    if not use_case:
+        raise ValueError("allowedUseCases cannot contain empty strings")
+    return use_case
+
+
+def sanitize_use_case_list(use_cases, context):
+    """Best-effort normalization: keep valid entries and skip malformed ones."""
+    sanitized = []
+    for use_case in use_cases:
+        try:
+            normalized_use_case = normalize_single_use_case(use_case)
+        except ValueError:
+            logger.warning(
+                "Skipping malformed allowed use case %r while %s", use_case, context
+            )
+            continue
+        if normalized_use_case not in sanitized:
+            sanitized.append(normalized_use_case)
+    return sanitized
+
+
 def normalize_use_case_list(use_cases):
     """Normalize a list of use-case strings: strip whitespace, remove empties, deduplicate.
 
@@ -379,10 +405,7 @@ def list_users():
         except (json.JSONDecodeError, TypeError):
             allowed_list = []
         if isinstance(allowed_list, list):
-            try:
-                allowed_list = normalize_use_case_list(allowed_list)
-            except ValueError:
-                allowed_list = []
+            allowed_list = sanitize_use_case_list(allowed_list, "listing users")
         else:
             allowed_list = []
 
@@ -491,10 +514,9 @@ def sync_cognito_users_to_dynamodb():
                     uc_list = []
                 if not isinstance(uc_list, list):
                     uc_list = []
-                try:
-                    uc_list = normalize_use_case_list(uc_list)
-                except ValueError:
-                    uc_list = []
+                uc_list = sanitize_use_case_list(
+                    uc_list, f"syncing Cognito user {email}"
+                )
                 # Non-admins must not have wildcard access
                 uc_list = [uc for uc in uc_list if uc != "*"]
                 if persona == "Supervisor" and not uc_list:
