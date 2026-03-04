@@ -14,6 +14,7 @@ from idp_common.config.configuration_manager import (
     ConfigurationManager,  # type: ignore[import-untyped]
 )
 from idp_common.config.merge_utils import merge_config_with_defaults
+from idp_common.config.models import IDPConfig
 from pydantic import ValidationError
 
 logger = logging.getLogger()
@@ -23,6 +24,7 @@ logging.getLogger("idp_common.bedrock.client").setLevel(
 )
 
 s3_client = boto3.client("s3")
+
 
 def fetch_content_from_s3(s3_uri: str) -> Union[Dict[str, Any], str]:
     """
@@ -72,6 +74,7 @@ def resolve_content(content: Union[str, Dict[str, Any]]) -> Union[Dict[str, Any]
         return fetch_content_from_s3(content)
     return content
 
+
 # Model mapping between regions
 MODEL_MAPPINGS = {
     "us.amazon.nova-lite-v1:0": "eu.amazon.nova-lite-v1:0",
@@ -92,12 +95,13 @@ MODEL_MAPPINGS = {
     "us.anthropic.claude-opus-4-5-20251101-v1:0": "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
 }
 
+
 def get_current_region() -> str:
     """Get the current AWS region"""
     region = boto3.Session().region_name
     if region is None:
         # Fallback to environment variable or default
-        region = os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
+        region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
     return region
 
 
@@ -140,11 +144,17 @@ def filter_models_by_region(data: Any, region_type: str) -> Any:
                         # Include models that match the region type or are region-agnostic
                         if region_type == "us":
                             # Include US models and non-region-specific models, exclude EU models
-                            if item.startswith("us.") or (not item.startswith("eu.") and not item.startswith("us.")):
+                            if item.startswith("us.") or (
+                                not item.startswith("eu.")
+                                and not item.startswith("us.")
+                            ):
                                 filtered_list.append(item)
                         elif region_type == "eu":
                             # Include EU models and non-region-specific models, exclude US models
-                            if item.startswith("eu.") or (not item.startswith("eu.") and not item.startswith("us.")):
+                            if item.startswith("eu.") or (
+                                not item.startswith("eu.")
+                                and not item.startswith("us.")
+                            ):
                                 filtered_list.append(item)
                         else:
                             # For other regions, include all models
@@ -187,20 +197,21 @@ def swap_model_ids(data: Any, region_type: str) -> Any:
     return data
 
 
-
 def detect_pattern_from_config(config: Dict[str, Any]) -> str:
     """
     Auto-detect the IDP pattern from config content.
-    
+
     Args:
         config: Configuration dictionary
-        
+
     Returns:
         Pattern name (pattern-1, pattern-2, or pattern-3)
     """
     # Check classification method
-    classification_method = config.get("classification", {}).get("classificationMethod", "")
-    
+    classification_method = config.get("classification", {}).get(
+        "classificationMethod", ""
+    )
+
     if classification_method == "bda":
         return "pattern-1"
     elif classification_method == "udop":
@@ -216,14 +227,14 @@ def merge_custom_with_defaults(
 ) -> Dict[str, Any]:
     """
     Merge a minimal custom config with system defaults.
-    
+
     This allows users to provide only the fields they want to customize,
     with all other fields populated from system defaults.
-    
+
     Args:
         custom_config: User's custom configuration (may be partial)
         pattern: Pattern to use for defaults. If None, auto-detected.
-        
+
     Returns:
         Complete configuration with defaults applied
     """
@@ -231,19 +242,23 @@ def merge_custom_with_defaults(
     if pattern is None:
         pattern = detect_pattern_from_config(custom_config)
         logger.info(f"Auto-detected pattern: {pattern}")
-    
+
     try:
         # Merge with system defaults
-        merged = merge_config_with_defaults(custom_config, pattern=pattern, validate=False)
-        
+        merged = merge_config_with_defaults(
+            custom_config, pattern=pattern, validate=False
+        )
+
         # Log merge summary
         user_keys = set(custom_config.keys())
         merged_keys = set(merged.keys())
-        logger.info(f"Merged custom config: user provided {len(user_keys)} sections, merged has {len(merged_keys)} sections")
+        logger.info(
+            f"Merged custom config: user provided {len(user_keys)} sections, merged has {len(merged_keys)} sections"
+        )
         logger.info(f"User-provided sections: {user_keys}")
-        
+
         return merged
-        
+
     except FileNotFoundError as e:
         # System defaults not available in Lambda - return config as-is
         logger.warning(f"System defaults not available, using config as-is: {e}")
@@ -296,25 +311,27 @@ def handler(event: Dict[str, Any], context: Any) -> None:
         if request_type in ["Create", "Update"]:
             # Collect all configurations to process
             configurations = {}
-            
+
             # Process Schema configuration
             if "Schema" in properties:
                 resolved_schema = resolve_content(properties["Schema"])
                 # Filter models based on region
                 if region_type in ["us", "eu"]:
-                    resolved_schema = filter_models_by_region(resolved_schema, region_type)
+                    resolved_schema = filter_models_by_region(
+                        resolved_schema, region_type
+                    )
                 configurations["Schema"] = {"Schema": resolved_schema}
 
             # Process Default configuration
             if "Default" in properties:
                 resolved_default = resolve_content(properties["Default"])
-                
+
                 # Merge minimal config with system defaults
                 # This allows config.yaml files to only specify what they want to customize
                 if isinstance(resolved_default, dict):
                     logger.info("Merging default config with system defaults...")
                     resolved_default = merge_custom_with_defaults(resolved_default)
-                
+
                 # Apply custom model ARNs if provided
                 if isinstance(resolved_default, dict):
                     # Replace classification model if CustomClassificationModelARN is provided and not empty
@@ -354,12 +371,12 @@ def handler(event: Dict[str, Any], context: Any) -> None:
                 # Remove legacy pricing field if present (now stored separately as DefaultPricing)
                 if isinstance(resolved_custom, dict):
                     resolved_custom.pop("pricing", None)
-                    
+
                     # Merge minimal custom config with system defaults
                     # This allows users to provide only customized fields
                     logger.info("Merging custom config with system defaults...")
                     resolved_custom = merge_custom_with_defaults(resolved_custom)
-                    
+
                 configurations["Custom"] = resolved_custom
 
             # Process DefaultPricing configuration if provided
@@ -389,8 +406,10 @@ def handler(event: Dict[str, Any], context: Any) -> None:
                 for uc_entry in use_case_configs:
                     try:
                         # Use shared validation from idp_common
-                        bu_id, uc_id = ConfigurationManager.validate_use_case_config_entry(
-                            uc_entry
+                        bu_id, uc_id = (
+                            ConfigurationManager.validate_use_case_config_entry(
+                                uc_entry
+                            )
                         )
 
                         uc_name = uc_entry.get("name", f"{bu_id}/{uc_id}")
@@ -406,7 +425,10 @@ def handler(event: Dict[str, Any], context: Any) -> None:
                         merged_view = merge_custom_with_defaults(uc_config_delta)
                         if region_type in ["us", "eu"]:
                             merged_view = swap_model_ids(merged_view, region_type)
-                            uc_config_delta = swap_model_ids(uc_config_delta, region_type)
+                            uc_config_delta = swap_model_ids(
+                                uc_config_delta, region_type
+                            )
+                        IDPConfig.parse_obj(merged_view)
 
                         resolved_entries.append(
                             {
@@ -458,7 +480,9 @@ def handler(event: Dict[str, Any], context: Any) -> None:
             # Apply region-specific model swapping to all configurations at once
             if region_type in ["us", "eu"] and configurations:
                 configurations = swap_model_ids(configurations, region_type)
-                logger.info(f"Applied model swapping for {region_type} region to all configurations")
+                logger.info(
+                    f"Applied model swapping for {region_type} region to all configurations"
+                )
 
             # Save all configurations
             for config_name, config_data in configurations.items():
